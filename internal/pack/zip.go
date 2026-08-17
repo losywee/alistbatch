@@ -2,6 +2,7 @@ package pack
 
 import (
 	"archive/zip"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,10 +25,9 @@ func ZipFolder(src, dst string) error {
 	defer zw.Close()
 
 	if !fi.IsDir() {
-		return addFileToZip(zw, src, filepath.Base(src))
+		return AddFileToZip(zw, src, filepath.Base(src))
 	}
 
-	// folder: walk and add
 	base := filepath.Base(strings.TrimRight(src, "/"))
 	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -40,10 +40,8 @@ func ZipFolder(src, dst string) error {
 		if rel == "." {
 			return nil
 		}
-		// store with top-level folder name
 		zipPath := filepath.ToSlash(filepath.Join(base, rel))
 		if info.IsDir() {
-			// ensure dir entry ends with /
 			if !strings.HasSuffix(zipPath, "/") {
 				zipPath += "/"
 			}
@@ -53,11 +51,12 @@ func ZipFolder(src, dst string) error {
 			})
 			return err
 		}
-		return addFileToZip(zw, path, zipPath)
+		return AddFileToZip(zw, path, zipPath)
 	})
 }
 
-func addFileToZip(zw *zip.Writer, filePath, zipPath string) error {
+// AddFileToZip adds a single file to zw. Exported for reuse by alist client.
+func AddFileToZip(zw *zip.Writer, filePath, zipPath string) error {
 	fi, err := os.Stat(filePath)
 	if err != nil {
 		return err
@@ -96,4 +95,113 @@ func ZipFolderToTemp(src string) (string, func(), error) {
 	}
 	cleanup := func() { os.Remove(tmpPath) }
 	return tmpPath, cleanup, nil
+}
+
+// ZipFolderToWriter streams zip of src (file or folder) to w.
+// It respects ctx cancellation.
+func ZipFolderToWriter(ctx context.Context, src string, w io.Writer) error {
+	fi, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	if !fi.IsDir() {
+		return AddFileToZip(zw, src, filepath.Base(src))
+	}
+
+	base := filepath.Base(strings.TrimRight(src, "/"))
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		zipPath := filepath.ToSlash(filepath.Join(base, rel))
+		if info.IsDir() {
+			if !strings.HasSuffix(zipPath, "/") {
+				zipPath += "/"
+			}
+			_, err := zw.CreateHeader(&zip.FileHeader{
+				Name:   zipPath,
+				Method: zip.Store,
+			})
+			return err
+		}
+		return AddFileToZip(zw, path, zipPath)
+	})
+}
+
+// ZipFolderPipe returns a reader that streams zip of src.
+// The zip is generated in a goroutine via io.Pipe. Caller must read to EOF or close.
+// ctx controls cancellation.
+func ZipFolderPipe(ctx context.Context, src string) (io.ReadCloser, error) {
+	pr, pw := io.Pipe()
+	zw := zip.NewWriter(pw)
+
+	go func() {
+		// zw.Close must happen before pw.Close to flush central directory.
+		// On error, CloseWithError propagates to reader.
+		var walkErr error
+		fi, err := os.Stat(src)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if !fi.IsDir() {
+			walkErr = AddFileToZip(zw, src, filepath.Base(src))
+		} else {
+			base := filepath.Base(strings.TrimRight(src, "/"))
+			walkErr = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				rel, err := filepath.Rel(src, path)
+				if err != nil {
+					return err
+				}
+				if rel == "." {
+					return nil
+				}
+				zipPath := filepath.ToSlash(filepath.Join(base, rel))
+				if info.IsDir() {
+					if !strings.HasSuffix(zipPath, "/") {
+						zipPath += "/"
+					}
+					_, err := zw.CreateHeader(&zip.FileHeader{
+						Name:   zipPath,
+						Method: zip.Store,
+					})
+					return err
+				}
+				return AddFileToZip(zw, path, zipPath)
+			})
+		}
+		if err := zw.Close(); err != nil && walkErr == nil {
+			walkErr = err
+		}
+		if walkErr != nil {
+			pw.CloseWithError(walkErr)
+			return
+		}
+		pw.Close()
+	}()
+
+	return pr, nil
 }

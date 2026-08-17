@@ -10,8 +10,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"alistbatch/internal/pack"
 )
 
 // Alist REST API docs: https://alist.nn.ci/guide/api.html
@@ -37,6 +42,17 @@ type Client struct {
 	// OnTokenRefresh is called after a successful auto re-login with the new token.
 	// Set it to persist the token (e.g. save to config file).
 	OnTokenRefresh func(newToken string)
+
+	mu sync.RWMutex // protects Token
+}
+
+// uploadClient returns an http.Client with no timeout but shared Transport for pooling.
+func (c *Client) uploadClient() *http.Client {
+	if c.HTTPClient != nil && c.HTTPClient.Transport != nil {
+		return &http.Client{Timeout: uploadTimeout, Transport: c.HTTPClient.Transport}
+	}
+	// share default transport for connection pooling
+	return &http.Client{Timeout: uploadTimeout, Transport: http.DefaultTransport}
 }
 
 func NewClient(host, token string) *Client {
@@ -49,6 +65,21 @@ func NewClient(host, token string) *Client {
 	}
 }
 
+// UploadError records a per-file failure when skipErrors is enabled.
+type UploadError struct {
+	Rel string
+	Err error
+}
+
+func (e UploadError) Error() string { return fmt.Sprintf("%s: %v", e.Rel, e.Err) }
+
+// UploadDirOptions controls batch folder upload.
+type UploadDirOptions struct {
+	AsTask     bool
+	Concurrency int
+	SkipErrors bool
+}
+
 // SetCredentials sets username/password for auto re-login on 401.
 func (c *Client) SetCredentials(username, password string) {
 	c.Username = username
@@ -59,15 +90,28 @@ func (c *Client) canRelogin() bool {
 	return c.Username != "" && c.Password != ""
 }
 
+func (c *Client) getToken() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Token
+}
+
+func (c *Client) setToken(tok string) {
+	c.mu.Lock()
+	c.Token = tok
+	c.mu.Unlock()
+}
+
 func (c *Client) relogin(ctx context.Context) error {
 	if !c.canRelogin() {
 		return fmt.Errorf("no credentials for re-login")
 	}
+	// LoginWithContext will set Token under lock
 	if err := c.LoginWithContext(ctx, c.Username, c.Password); err != nil {
 		return err
 	}
 	if c.OnTokenRefresh != nil {
-		c.OnTokenRefresh(c.Token)
+		c.OnTokenRefresh(c.getToken())
 	}
 	return nil
 }
@@ -113,7 +157,7 @@ func (c *Client) LoginWithContext(ctx context.Context, username, password string
 	if r.Data.Token == "" {
 		return fmt.Errorf("login: empty token")
 	}
-	c.Token = r.Data.Token
+	c.setToken(r.Data.Token)
 	return nil
 }
 
@@ -142,13 +186,12 @@ func (c *Client) doJSONWithContext(ctx context.Context, method, path string, pay
 	if err != nil {
 		return nil, err
 	}
-	// doJSON is always POST in current usage; keep method param for future
 	if method != "POST" {
 		req.Method = method
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", c.Token)
+	if tok := c.getToken(); tok != "" {
+		req.Header.Set("Authorization", tok)
 	}
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -176,7 +219,7 @@ func (c *Client) doJSONWithContext(ctx context.Context, method, path string, pay
 				retryReq.Method = method
 			}
 			retryReq.Header.Set("Content-Type", "application/json")
-			retryReq.Header.Set("Authorization", c.Token)
+			retryReq.Header.Set("Authorization", c.getToken())
 			retryResp, err := c.HTTPClient.Do(retryReq)
 			if err != nil {
 				return nil, err
@@ -373,7 +416,178 @@ func (c *Client) ListRecursiveWithDepth(root string, perPage int, refresh bool, 
 	return result, nil
 }
 
-// ---------- upload ----------
+// ---------- put stream ----------
+
+// PutStreamOptions controls PUT /api/fs/put streaming upload.
+type PutStreamOptions struct {
+	AsTask      bool
+	ContentType string // default application/octet-stream
+	Overwrite   bool   // reserved, Alist always overwrites
+}
+
+// PutStream streams r to remotePath via PUT /api/fs/put.
+// size <0 means unknown (chunked).
+// For non-seekable readers, 401 retry is not possible — caller must handle re-login.
+// For seekable readers (io.Seeker), 401 auto-retry rewinds and retries once.
+// ctx may be nil (uses Background).
+func (c *Client) PutStream(ctx context.Context, r io.Reader, size int64, remotePath string, opts PutStreamOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.putStreamWithRetry(ctx, r, size, remotePath, opts, true)
+}
+
+func (c *Client) putStreamWithRetry(ctx context.Context, r io.Reader, size int64, remotePath string, opts PutStreamOptions, allowRetry bool) error {
+	if opts.ContentType == "" {
+		opts.ContentType = "application/octet-stream"
+	}
+	parent := filepath.ToSlash(filepath.Dir(remotePath))
+	if parent != "/" && parent != "." {
+		if err := c.EnsureDir(parent); err != nil {
+			return fmt.Errorf("ensure dir %s: %w", parent, err)
+		}
+	}
+	encodedPath := encodeFilePath(remotePath)
+
+	// wrap reader for Close if needed
+	var rc io.ReadCloser
+	if closer, ok := r.(io.ReadCloser); ok {
+		rc = closer
+	} else {
+		rc = io.NopCloser(r)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.Host+"/api/fs/put", rc)
+	if err != nil {
+		return err
+	}
+	if size >= 0 {
+		req.ContentLength = size
+	}
+	req.Header.Set("Authorization", c.getToken())
+	req.Header.Set("File-Path", encodedPath)
+	req.Header.Set("Content-Type", opts.ContentType)
+	if opts.AsTask {
+		req.Header.Set("As-Task", "true")
+	} else {
+		req.Header.Set("As-Task", "false")
+	}
+
+	resp, err := c.uploadClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var ar apiResp
+	if err := json.Unmarshal(b, &ar); err != nil {
+		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
+	}
+	if ar.Code != 200 {
+		if allowRetry && isUnauthorizedCode(ar.Code, ar.Message) && c.canRelogin() {
+			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			if err := c.relogin(ctx); err != nil {
+				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", ar.Code, ar.Message, err)
+			}
+			// retry only if seekable
+			if seeker, ok := r.(io.Seeker); ok {
+				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
+					return fmt.Errorf("upload failed code=%d msg=%s (seek for retry failed: %v)", ar.Code, ar.Message, err)
+				}
+				return c.putStreamWithRetry(ctx, r, size, remotePath, opts, false)
+			}
+			return fmt.Errorf("upload failed code=%d msg=%s (cannot retry non-seekable stream, re-login succeeded — retry manually)", ar.Code, ar.Message)
+		}
+		return fmt.Errorf("upload failed code=%d msg=%s body=%s", ar.Code, ar.Message, string(b))
+	}
+	return nil
+}
+
+// PutFile is a convenience wrapper for PutStream with a local file.
+// ctx may be nil (uses Background).
+func (c *Client) PutFile(ctx context.Context, localPath, remotePath string, opts PutStreamOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return c.PutStream(ctx, f, fi.Size(), remotePath, opts)
+}
+
+// PutFolder uploads a local folder to remotePath.
+// If asZip is true, the folder is zipped and streamed via PutStream (chunked, no temp file).
+// Otherwise it uploads file-by-file via UploadDirConcurrent with concurrency.
+func (c *Client) PutFolder(ctx context.Context, localDir, remotePath string, opts PutStreamOptions, asZip bool, concurrency int) error {
+	return c.PutFolderWithOptions(ctx, localDir, remotePath, opts, asZip, UploadDirOptions{Concurrency: concurrency})
+}
+
+// PutFolderWithOptions is like PutFolder but supports SkipErrors for file-by-file mode.
+func (c *Client) PutFolderWithOptions(ctx context.Context, localDir, remotePath string, opts PutStreamOptions, asZip bool, dirOpts UploadDirOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	fi, err := os.Stat(localDir)
+	if err != nil {
+		return err
+	}
+	if !fi.IsDir() {
+		return c.PutFile(ctx, localDir, remotePath, opts)
+	}
+	if asZip {
+		if !strings.HasSuffix(strings.ToLower(remotePath), ".zip") {
+			if strings.HasSuffix(remotePath, "/") {
+				remotePath = remotePath + filepath.Base(strings.TrimRight(localDir, "/")) + ".zip"
+			} else if !strings.Contains(filepath.Base(remotePath), ".") {
+				remotePath += ".zip"
+			}
+		}
+		return c.putFolderAsZipStream(ctx, localDir, remotePath, opts)
+	}
+	_, _, failed, err := c.UploadDirConcurrentWithOptions(ctx, localDir, remotePath, dirOpts)
+	if err != nil {
+		return err
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("put folder completed with %d errors (skipped)", len(failed))
+	}
+	return nil
+}
+
+func (c *Client) putFolderAsZipStream(ctx context.Context, localDir, remotePath string, opts PutStreamOptions) error {
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		err := pack.ZipFolderToWriter(ctx, localDir, pw)
+		if err != nil {
+			pw.CloseWithError(err)
+			errCh <- err
+			return
+		}
+		// Close zip writer flush is inside ZipFolderToWriter; just close pipe.
+		pw.Close()
+		errCh <- nil
+	}()
+
+	putErr := c.PutStream(ctx, pr, -1, remotePath, opts)
+	if putErr != nil {
+		// Unblock zip goroutine if PutStream fails early (reader gone, writer blocks).
+		pr.Close()
+	}
+	zipErr := <-errCh
+	if putErr != nil {
+		return putErr
+	}
+	return zipErr
+}
+
+// ---------- upload (file/folder) ----------
 
 // UploadFile streams local file to remotePath via PUT /api/fs/put.
 // Alist expects headers: Authorization, File-Path (url-encoded), As-Task, Content-Type.
@@ -405,7 +619,6 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 	if err != nil {
 		return err
 	}
-	// close on return; on retry we close explicitly before recursing
 	shouldClose := true
 	defer func() {
 		if shouldClose {
@@ -418,7 +631,7 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 		return err
 	}
 	req.ContentLength = fi.Size()
-	req.Header.Set("Authorization", c.Token)
+	req.Header.Set("Authorization", c.getToken())
 	req.Header.Set("File-Path", encodedPath)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	if asTask {
@@ -427,7 +640,6 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 		req.Header.Set("As-Task", "false")
 	}
 
-	uploadClient := &http.Client{Timeout: uploadTimeout}
 	var body io.ReadCloser = f
 	if !asTask && fi.Size() > 0 {
 		pr := &progressReader{Reader: f, total: fi.Size(), name: filepath.Base(localPath), start: time.Now()}
@@ -435,7 +647,7 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 	}
 	req.Body = body
 
-	resp, err := uploadClient.Do(req)
+	resp, err := c.uploadClient().Do(req)
 	if err != nil {
 		return err
 	}
@@ -467,8 +679,188 @@ func (c *Client) UploadDirRecursive(localDir, remoteDir string, asTask bool) (in
 }
 
 func (c *Client) UploadDirRecursiveWithContext(ctx context.Context, localDir, remoteDir string, asTask bool) (int, int64, error) {
+	return c.UploadDirConcurrentWithContext(ctx, localDir, remoteDir, asTask, 1)
+}
+
+// UploadDirConcurrent uploads folder file-by-file with concurrency.
+// concurrency <=1 means sequential.
+func (c *Client) UploadDirConcurrent(localDir, remoteDir string, asTask bool, concurrency int) (int, int64, error) {
+	return c.UploadDirConcurrentWithContext(context.Background(), localDir, remoteDir, asTask, concurrency)
+}
+
+func (c *Client) UploadDirConcurrentWithContext(ctx context.Context, localDir, remoteDir string, asTask bool, concurrency int) (int, int64, error) {
+	count, total, failed, err := c.UploadDirConcurrentWithOptions(ctx, localDir, remoteDir, UploadDirOptions{AsTask: asTask, Concurrency: concurrency})
+	if err != nil {
+		return count, total, err
+	}
+	if len(failed) > 0 {
+		return count, total, failed[0].Err
+	}
+	return count, total, nil
+}
+
+// UploadDirConcurrentWithOptions uploads folder with full options including SkipErrors.
+// Returns count, total bytes, failed files, and fatal error (nil if SkipErrors and only per-file failures).
+func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, remoteDir string, opts UploadDirOptions) (int, int64, []UploadError, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	concurrency := opts.Concurrency
+	if concurrency <= 1 {
+		return c.uploadDirSequentialWithOptions(ctx, localDir, remoteDir, opts)
+	}
+
+	type job struct {
+		localPath  string
+		remotePath string
+		size       int64
+		rel        string
+	}
+	var jobs []job
+	if err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(localDir, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		remotePath := strings.TrimRight(remoteDir, "/") + "/" + rel
+		jobs = append(jobs, job{localPath: path, remotePath: remotePath, size: info.Size(), rel: rel})
+		return nil
+	}); err != nil {
+		return 0, 0, nil, err
+	}
+	if len(jobs) == 0 {
+		return 0, 0, nil, nil
+	}
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].rel < jobs[j].rel })
+
+	if err := c.EnsureDir(remoteDir); err != nil {
+		return 0, 0, nil, fmt.Errorf("ensure dir %s: %w", remoteDir, err)
+	}
+	seen := make(map[string]bool)
+	for _, j := range jobs {
+		dir := filepath.ToSlash(filepath.Dir(j.remotePath))
+		if dir != "/" && dir != "." && !seen[dir] {
+			seen[dir] = true
+		}
+	}
+	var dirs []string
+	for d := range seen {
+		dirs = append(dirs, d)
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.Count(dirs[i], "/") < strings.Count(dirs[j], "/") })
+	for _, d := range dirs {
+		if err := c.EnsureDir(d); err != nil {
+			return 0, 0, nil, fmt.Errorf("ensure dir %s: %w", d, err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobCh := make(chan job)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	var count atomic.Int64
+	var total atomic.Int64
+	var completed atomic.Int64
+	var failedMu sync.Mutex
+	var failed []UploadError
+
+	worker := func() {
+		defer wg.Done()
+		for j := range jobCh {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if err := c.uploadFileDirect(ctx, j.localPath, j.remotePath, opts.AsTask); err != nil {
+				if opts.SkipErrors {
+					failedMu.Lock()
+					failed = append(failed, UploadError{Rel: j.rel, Err: err})
+					failedMu.Unlock()
+					n := completed.Add(1)
+					fmt.Fprintf(os.Stderr, "  [%d/%d] %s -> %s FAILED: %v (skipped)\n", n, len(jobs), j.rel, j.remotePath, err)
+					continue
+				}
+				select {
+				case errCh <- fmt.Errorf("upload %s: %w", j.rel, err):
+				default:
+				}
+				cancel()
+				return
+			}
+			count.Add(1)
+			total.Add(j.size)
+			n := completed.Add(1)
+			fmt.Fprintf(os.Stderr, "  [%d/%d] %s -> %s (%d bytes) done\n", n, len(jobs), j.rel, j.remotePath, j.size)
+		}
+	}
+
+	if concurrency > len(jobs) {
+		concurrency = len(jobs)
+	}
+	if concurrency > 32 {
+		concurrency = 32
+	}
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go worker()
+	}
+
+	go func() {
+		defer close(jobCh)
+		for _, j := range jobs {
+			select {
+			case <-ctx.Done():
+				return
+			case jobCh <- j:
+			}
+		}
+	}()
+
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return int(count.Load()), total.Load(), failed, err
+	default:
+	}
+	if err := ctx.Err(); err != nil && err != context.Canceled {
+		return int(count.Load()), total.Load(), failed, err
+	}
+	select {
+	case err := <-errCh:
+		return int(count.Load()), total.Load(), failed, err
+	default:
+		return int(count.Load()), total.Load(), failed, nil
+	}
+}
+
+func (c *Client) uploadDirSequential(ctx context.Context, localDir, remoteDir string, asTask bool) (int, int64, error) {
+	count, total, failed, err := c.uploadDirSequentialWithOptions(ctx, localDir, remoteDir, UploadDirOptions{AsTask: asTask})
+	if err != nil {
+		return count, total, err
+	}
+	if len(failed) > 0 {
+		return count, total, failed[0].Err
+	}
+	return count, total, nil
+}
+
+func (c *Client) uploadDirSequentialWithOptions(ctx context.Context, localDir, remoteDir string, opts UploadDirOptions) (int, int64, []UploadError, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var count int
 	var total int64
+	var failed []UploadError
 	err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -487,15 +879,80 @@ func (c *Client) UploadDirRecursiveWithContext(ctx context.Context, localDir, re
 		}
 		rel = filepath.ToSlash(rel)
 		remotePath := strings.TrimRight(remoteDir, "/") + "/" + rel
-		fmt.Fprintf(os.Stderr, "  [%d] %s -> %s (%d bytes)\n", count+1, rel, remotePath, info.Size())
-		if err := c.UploadFileWithContext(ctx, path, remotePath, asTask, true); err != nil {
+		fmt.Fprintf(os.Stderr, "  [%d] %s -> %s (%d bytes)\n", count+1+len(failed), rel, remotePath, info.Size())
+		if err := c.UploadFileWithContext(ctx, path, remotePath, opts.AsTask, true); err != nil {
+			if opts.SkipErrors {
+				fmt.Fprintf(os.Stderr, "  %s FAILED: %v (skipped)\n", rel, err)
+				failed = append(failed, UploadError{Rel: rel, Err: err})
+				return nil
+			}
 			return fmt.Errorf("upload %s: %w", rel, err)
 		}
 		count++
 		total += info.Size()
 		return nil
 	})
-	return count, total, err
+	return count, total, failed, err
+}
+
+// uploadFileDirect uploads without EnsureDir (caller ensures dirs).
+func (c *Client) uploadFileDirect(ctx context.Context, localPath, remotePath string, asTask bool) error {
+	fi, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+	encodedPath := encodeFilePath(remotePath)
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	shouldClose := true
+	defer func() {
+		if shouldClose {
+			f.Close()
+		}
+	}()
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.Host+"/api/fs/put", f)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = fi.Size()
+	req.Header.Set("Authorization", c.getToken())
+	req.Header.Set("File-Path", encodedPath)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if asTask {
+		req.Header.Set("As-Task", "true")
+	} else {
+		req.Header.Set("As-Task", "false")
+	}
+	var body io.ReadCloser = f
+	if !asTask && fi.Size() > 0 {
+		body = f
+	}
+	req.Body = body
+	resp, err := c.uploadClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	var r apiResp
+	if err := json.Unmarshal(b, &r); err != nil {
+		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
+	}
+	if r.Code != 200 {
+		if isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
+			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			if err := c.relogin(ctx); err != nil {
+				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", r.Code, r.Message, err)
+			}
+			shouldClose = false
+			f.Close()
+			return c.uploadFileDirect(ctx, localPath, remotePath, asTask)
+		}
+		return fmt.Errorf("upload failed code=%d msg=%s body=%s", r.Code, r.Message, string(b))
+	}
+	return nil
 }
 
 func encodeFilePath(p string) string {

@@ -28,6 +28,8 @@ func main() {
 	switch cmd {
 	case "upload":
 		runUpload(args)
+	case "put":
+		runPut(args)
 	case "pack":
 		runPack(args)
 	case "login":
@@ -61,6 +63,7 @@ Usage:
 
 Commands:
   upload    Upload file or folder to Alist (folders are zipped by default)
+  put       Stream upload to PUT /api/fs/put (file or stdin)
   pack      Pack a folder into zip without uploading
   login     Login and save credentials to local config
   logout    Clear saved token (or --all to clear everything)
@@ -84,8 +87,23 @@ Upload examples:
   alistbatch upload -s ./mydir -r /backup/mydir.zip
   alistbatch upload -s ./mydir -r /backup/mydir --no-zip
 
+  # concurrent upload (folder --no-zip only)
+  alistbatch upload -s ./mydir -r /backup/mydir --no-zip --concurrency 8
+  alistbatch upload -s ./mydir -r /backup/mydir --no-zip -c 8
+  alistbatch upload -s ./mydir -r /backup/mydir --no-zip -c 8 --skip-errors
+
   # one-off with explicit host/token (no save)
   alistbatch upload -H https://alist.example.com -t $TOKEN -s ./a.txt -r /a.txt --save=false
+
+Put examples (streaming PUT /api/fs/put):
+  alistbatch put -r /remote/file.txt ./local.txt
+  alistbatch put -r /remote/file.txt --stdin < file.txt
+  cat file.txt | alistbatch put -r /remote/file.txt --stdin
+  echo "hello" | alistbatch put -r /remote/hello.txt --stdin --content-type text/plain
+  alistbatch put -r /remote/big.bin ./big.bin --as-task
+  alistbatch put -r /remote/dir ./localdir --no-zip -c 8   # folder concurrent
+  alistbatch put -r /remote/dir ./localdir --no-zip -c 8 --skip-errors
+  alistbatch put -r /remote/dir.zip ./localdir --zip       # folder as zip stream
 
 Pack examples:
   alistbatch pack ./mydir -o mydir.zip
@@ -101,6 +119,8 @@ Flags (upload/login/mkdir/ls):
   -u, --username  Username
   -p, --password  Password
   -t, --token     Token (skip login if provided)
+  -c, --concurrency  Concurrent uploads for folder --no-zip (default 1)
+      --skip-errors  Skip failed files and continue (batch upload, exit 2 if any skipped)
 `, version, config.Path())
 }
 
@@ -177,12 +197,15 @@ func ensureClient(a *resolvedAuth, save bool) (*alist.Client, error) {
 
 func runUpload(args []string) {
 	args = normalizeArgs(args, map[string]string{
-		"--host":     "-H",
-		"--username": "-u",
-		"--password": "-p",
-		"--token":    "-t",
-		"--src":      "-s",
-		"--remote":   "-r",
+		"--host":             "-H",
+		"--username":         "-u",
+		"--password":         "-p",
+		"--token":            "-t",
+		"--src":              "-s",
+		"--remote":           "-r",
+		"--concurrency":      "-c",
+		"--skip-errors":      "-skip-errors",
+		"--continue-on-error": "-skip-errors",
 	})
 	fs := flag.NewFlagSet("upload", flag.ExitOnError)
 	hostF := fs.String("H", "", "Alist host")
@@ -195,6 +218,8 @@ func runUpload(args []string) {
 	asTask := fs.Bool("as-task", false, "upload as Alist task (for large files)")
 	overwrite := fs.Bool("overwrite", true, "overwrite if exists (Alist default)")
 	save := fs.Bool("save", true, "save credentials to local config after login (use --save=false to disable)")
+	concurrency := fs.Int("c", 1, "concurrent uploads for folder --no-zip (e.g. -c 8)")
+	skipErrors := fs.Bool("skip-errors", false, "skip failed files and continue (batch upload only)")
 
 	fs.Parse(args)
 	rest := fs.Args()
@@ -253,15 +278,43 @@ func runUpload(args []string) {
 	}
 
 	if *noZip {
-		fmt.Fprintf(os.Stderr, "uploading folder recursively %s -> %s\n", *src, *remote)
-		if err := client.EnsureDir(*remote); err != nil {
-			fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", *remote, err)
-			os.Exit(1)
+		if *concurrency < 1 {
+			*concurrency = 1
 		}
-		count, bytes, err := client.UploadDirRecursive(*src, *remote, *asTask)
+		if *concurrency > 32 {
+			fmt.Fprintln(os.Stderr, "warning: concurrency capped at 32")
+			*concurrency = 32
+		}
+		dirOpts := alist.UploadDirOptions{AsTask: *asTask, Concurrency: *concurrency, SkipErrors: *skipErrors}
+		if *concurrency > 1 {
+			fmt.Fprintf(os.Stderr, "uploading folder recursively %s -> %s (concurrency=%d skip-errors=%v)\n", *src, *remote, *concurrency, *skipErrors)
+			count, bytes, failed, err := client.UploadDirConcurrentWithOptions(nil, *src, *remote, dirOpts)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "upload dir failed: %v\n", err)
+				os.Exit(1)
+			}
+			if len(failed) > 0 {
+				fmt.Fprintf(os.Stderr, "done: %d files, %s, %d failed (skipped):\n", count, humanBytes(bytes), len(failed))
+				for _, fe := range failed {
+					fmt.Fprintf(os.Stderr, "  skip %s: %v\n", fe.Rel, fe.Err)
+				}
+				os.Exit(2)
+			}
+			fmt.Fprintf(os.Stderr, "done: %d files, %s\n", count, humanBytes(bytes))
+			return
+		}
+		fmt.Fprintf(os.Stderr, "uploading folder recursively %s -> %s (skip-errors=%v)\n", *src, *remote, *skipErrors)
+		count, bytes, failed, err := client.UploadDirConcurrentWithOptions(nil, *src, *remote, dirOpts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "upload dir failed: %v\n", err)
 			os.Exit(1)
+		}
+		if len(failed) > 0 {
+			fmt.Fprintf(os.Stderr, "done: %d files, %s, %d failed (skipped):\n", count, humanBytes(bytes), len(failed))
+			for _, fe := range failed {
+				fmt.Fprintf(os.Stderr, "  skip %s: %v\n", fe.Rel, fe.Err)
+			}
+			os.Exit(2)
 		}
 		fmt.Fprintf(os.Stderr, "done: %d files, %s\n", count, humanBytes(bytes))
 		return
@@ -284,6 +337,162 @@ func runUpload(args []string) {
 	fmt.Fprintf(os.Stderr, "packed %s (%s) -> uploading to %s\n", tmpZip, humanBytes(fi2.Size()), *remote)
 	if err := client.UploadFile(tmpZip, *remote, *asTask, *overwrite); err != nil {
 		fmt.Fprintf(os.Stderr, "upload failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintln(os.Stderr, "done")
+}
+
+func runPut(args []string) {
+	args = normalizeArgs(args, map[string]string{
+		"--host":              "-H",
+		"--username":          "-u",
+		"--password":          "-p",
+		"--token":             "-t",
+		"--remote":            "-r",
+		"--stdin":             "-stdin",
+		"--content-type":      "-content-type",
+		"--as-task":           "-as-task",
+		"--concurrency":       "-c",
+		"--zip":               "-zip",
+		"--skip-errors":       "-skip-errors",
+		"--continue-on-error": "-skip-errors",
+	})
+	fs := flag.NewFlagSet("put", flag.ExitOnError)
+	hostF := fs.String("H", "", "Alist host")
+	usernameF := fs.String("u", "", "username")
+	passwordF := fs.String("p", "", "password")
+	tokenF := fs.String("t", "", "token")
+	remoteF := fs.String("r", "", "remote path (required, e.g. /a/b.txt)")
+	useStdin := fs.Bool("stdin", false, "read from stdin instead of file")
+	contentType := fs.String("content-type", "application/octet-stream", "Content-Type header")
+	asTask := fs.Bool("as-task", false, "upload as Alist task")
+	save := fs.Bool("save", true, "save credentials after login")
+	concurrency := fs.Int("c", 4, "concurrent uploads for folder (default 4)")
+	useZip := fs.Bool("zip", false, "zip folder before streaming (put folder as single zip)")
+	noZip := fs.Bool("no-zip", false, "upload folder file-by-file (default for put folder)")
+	skipErrors := fs.Bool("skip-errors", false, "skip failed files and continue (folder upload only)")
+	fs.Parse(args)
+	rest := fs.Args()
+
+	if *remoteF == "" {
+		if len(rest) >= 1 && *useStdin {
+			*remoteF = rest[0]
+		} else if len(rest) >= 2 {
+			*remoteF = rest[1]
+		} else if len(rest) == 1 && !*useStdin {
+			if strings.HasPrefix(rest[0], "/") {
+				*remoteF = rest[0]
+				*useStdin = true
+			}
+		}
+	}
+	if *remoteF == "" {
+		fmt.Fprintln(os.Stderr, "error: -r <remote path> is required")
+		fmt.Fprintln(os.Stderr, "usage: alistbatch put -r /remote/file.txt [local-file]")
+		fmt.Fprintln(os.Stderr, "       alistbatch put -r /remote/file.txt --stdin < file")
+		fmt.Fprintln(os.Stderr, "       cat file | alistbatch put -r /remote/file.txt --stdin")
+		fmt.Fprintln(os.Stderr, "       alistbatch put -r /remote/dir ./localdir --no-zip -c 8")
+		fmt.Fprintln(os.Stderr, "       alistbatch put -r /remote/dir.zip ./localdir --zip")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if !strings.HasPrefix(*remoteF, "/") {
+		*remoteF = "/" + *remoteF
+	}
+
+	auth, err := resolveAuth(*hostF, *tokenF, *usernameF, *passwordF)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve auth: %v\n", err)
+		os.Exit(1)
+	}
+	client, err := ensureClient(auth, *save)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	opts := alist.PutStreamOptions{
+		AsTask:      *asTask,
+		ContentType: *contentType,
+	}
+
+	if *useStdin {
+		fmt.Fprintf(os.Stderr, "streaming stdin -> %s\n", *remoteF)
+		if err := client.PutStream(nil, os.Stdin, -1, *remoteF, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "put failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "done")
+		return
+	}
+
+	local := ""
+	if len(rest) >= 1 {
+		local = rest[0]
+		if len(rest) >= 2 && rest[1] == *remoteF {
+			local = rest[0]
+		}
+	}
+	if local == "" {
+		fmt.Fprintln(os.Stderr, "error: local file required (or use --stdin)")
+		fmt.Fprintln(os.Stderr, "usage: alistbatch put -r /remote/file.txt <local-file>")
+		fmt.Fprintln(os.Stderr, "       alistbatch put <local-file> <remote-path>")
+		fmt.Fprintln(os.Stderr, "       alistbatch put -r /remote/dir ./localdir [--zip|--no-zip] [-c 8]")
+		os.Exit(1)
+	}
+	fi, err := os.Stat(local)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stat %s: %v\n", local, err)
+		os.Exit(1)
+	}
+
+	// folder handling
+	if fi.IsDir() {
+		if *useZip && *noZip {
+			fmt.Fprintln(os.Stderr, "error: --zip and --no-zip cannot be used together")
+			os.Exit(1)
+		}
+		if *concurrency < 1 {
+			*concurrency = 1
+		}
+		if *concurrency > 32 {
+			fmt.Fprintln(os.Stderr, "warning: concurrency capped at 32")
+			*concurrency = 32
+		}
+		if *useZip {
+			fmt.Fprintf(os.Stderr, "zipping and streaming folder %s -> %s\n", local, *remoteF)
+			if err := client.PutFolder(nil, local, *remoteF, opts, true, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "put folder (zip) failed: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintln(os.Stderr, "done")
+			return
+		}
+		dirOpts := alist.UploadDirOptions{AsTask: *asTask, Concurrency: *concurrency, SkipErrors: *skipErrors}
+		if *concurrency > 1 {
+			fmt.Fprintf(os.Stderr, "put folder %s -> %s (concurrency=%d skip-errors=%v)\n", local, *remoteF, *concurrency, *skipErrors)
+		} else {
+			fmt.Fprintf(os.Stderr, "put folder %s -> %s (skip-errors=%v)\n", local, *remoteF, *skipErrors)
+		}
+		_, _, failed, err := client.UploadDirConcurrentWithOptions(nil, local, *remoteF, dirOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "put folder failed: %v\n", err)
+			os.Exit(1)
+		}
+		if len(failed) > 0 {
+			fmt.Fprintf(os.Stderr, "put folder completed with %d skipped errors:\n", len(failed))
+			for _, fe := range failed {
+				fmt.Fprintf(os.Stderr, "  skip %s: %v\n", fe.Rel, fe.Err)
+			}
+			os.Exit(2)
+		}
+		fmt.Fprintln(os.Stderr, "done")
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "uploading %s -> %s (%s)\n", local, *remoteF, humanBytes(fi.Size()))
+	if err := client.PutFile(nil, local, *remoteF, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "put failed: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Fprintln(os.Stderr, "done")
@@ -717,11 +926,11 @@ func humanBytes(n int64) string {
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
 	div, exp := int64(unit), 0
-	for n >= div*unit && exp < 5 {
+	for exp < len(units)-1 && n >= div*unit {
 		div *= unit
 		exp++
 	}
-	units := []string{"KB", "MB", "GB", "TB", "PB"}
 	return fmt.Sprintf("%.1f %s", float64(n)/float64(div), units[exp])
 }

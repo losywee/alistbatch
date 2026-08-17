@@ -73,6 +73,8 @@ func Save(c *Config) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
+	// tighten perms if dir already existed with looser mode
+	_ = os.Chmod(dir, 0700)
 	c.Host = strings.TrimRight(strings.TrimSpace(c.Host), "/")
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
@@ -82,6 +84,7 @@ func Save(c *Config) error {
 	if err := os.WriteFile(tmp, b, 0600); err != nil {
 		return err
 	}
+	// ensure 0600 regardless of umask
 	if err := os.Chmod(tmp, 0600); err != nil {
 		_ = os.Remove(tmp)
 		return err
