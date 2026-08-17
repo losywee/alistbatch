@@ -2,6 +2,7 @@ package alist
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,11 @@ import (
 //   GET  /api/fs/get              -> ?path=
 //   DELETE /api/fs/remove         -> {names, dir}
 
+const (
+	defaultTimeout = 30 * time.Second
+	uploadTimeout  = 0 // no timeout for streaming upload
+)
+
 type Client struct {
 	Host       string
 	Token      string
@@ -38,7 +44,7 @@ func NewClient(host, token string) *Client {
 		Host:  strings.TrimRight(host, "/"),
 		Token: token,
 		HTTPClient: &http.Client{
-			Timeout: 0, // no timeout for large uploads; per-request context controls
+			Timeout: defaultTimeout,
 		},
 	}
 }
@@ -53,11 +59,11 @@ func (c *Client) canRelogin() bool {
 	return c.Username != "" && c.Password != ""
 }
 
-func (c *Client) relogin() error {
+func (c *Client) relogin(ctx context.Context) error {
 	if !c.canRelogin() {
 		return fmt.Errorf("no credentials for re-login")
 	}
-	if err := c.Login(c.Username, c.Password); err != nil {
+	if err := c.LoginWithContext(ctx, c.Username, c.Password); err != nil {
 		return err
 	}
 	if c.OnTokenRefresh != nil {
@@ -82,8 +88,12 @@ type loginResp struct {
 }
 
 func (c *Client) Login(username, password string) error {
+	return c.LoginWithContext(context.Background(), username, password)
+}
+
+func (c *Client) LoginWithContext(ctx context.Context, username, password string) error {
 	body, _ := json.Marshal(loginReq{Username: username, Password: password})
-	req, err := http.NewRequest("POST", c.Host+"/api/auth/login", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.Host+"/api/auth/login", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -116,11 +126,10 @@ type apiResp struct {
 }
 
 func (c *Client) doJSON(method, path string, payload any) (*apiResp, error) {
-	return c.doJSONWithRetry(method, path, payload, true)
+	return c.doJSONWithContext(context.Background(), method, path, payload, true)
 }
 
-func (c *Client) doJSONWithRetry(method, path string, payload any, allowRetry bool) (*apiResp, error) {
-	var body io.Reader
+func (c *Client) doJSONWithContext(ctx context.Context, method, path string, payload any, allowRetry bool) (*apiResp, error) {
 	var bodyBytes []byte
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -128,11 +137,14 @@ func (c *Client) doJSONWithRetry(method, path string, payload any, allowRetry bo
 			return nil, err
 		}
 		bodyBytes = b
-		body = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, c.Host+path, body)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.Host+path, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, err
+	}
+	// doJSON is always POST in current usage; keep method param for future
+	if method != "POST" {
+		req.Method = method
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.Token != "" {
@@ -152,19 +164,16 @@ func (c *Client) doJSONWithRetry(method, path string, payload any, allowRetry bo
 		return nil, fmt.Errorf("decode %s %s: %w body=%s", method, path, err, string(b))
 	}
 	if r.Code != 200 {
-		// auto re-login on 401 and retry once
 		if allowRetry && isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
-			if err := c.relogin(); err != nil {
+			if err := c.relogin(ctx); err != nil {
 				return &r, fmt.Errorf("api %s %s code=%d msg=%s (re-login failed: %v)", method, path, r.Code, r.Message, err)
 			}
-			// retry with new token — need to rebuild body
-			var retryBody io.Reader
-			if bodyBytes != nil {
-				retryBody = bytes.NewReader(bodyBytes)
-			}
-			retryReq, err := http.NewRequest(method, c.Host+path, retryBody)
+			retryReq, err := http.NewRequestWithContext(ctx, "POST", c.Host+path, bytes.NewReader(bodyBytes))
 			if err != nil {
 				return nil, err
+			}
+			if method != "POST" {
+				retryReq.Method = method
 			}
 			retryReq.Header.Set("Content-Type", "application/json")
 			retryReq.Header.Set("Authorization", c.Token)
@@ -199,6 +208,16 @@ func isUnauthorizedCode(code int, msg string) bool {
 	return strings.Contains(lower, "unauthorized") || strings.Contains(lower, "not login") || strings.Contains(lower, "token expired") || strings.Contains(lower, "please login")
 }
 
+// IsUnauthorized reports whether err is a 401/unauthorized from Alist.
+// Kept for backward compat; prefer isUnauthorizedCode internally.
+func IsUnauthorized(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "code=401") || strings.Contains(s, "unauthorized") || strings.Contains(s, "not login") || strings.Contains(s, "token expired")
+}
+
 // ---------- fs ops ----------
 
 func (c *Client) Mkdir(path string) error {
@@ -221,7 +240,6 @@ func (c *Client) EnsureDir(dir string) error {
 			if isAlreadyExistsErr(err) {
 				continue
 			}
-			// Alist error messages vary by storage driver; verify via List.
 			if _, lerr := c.List(cur); lerr == nil {
 				continue
 			}
@@ -233,16 +251,7 @@ func (c *Client) EnsureDir(dir string) error {
 
 func isAlreadyExistsErr(err error) bool {
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "already exists") || strings.Contains(s, "already exist") || strings.Contains(s, "exists")
-}
-
-// IsUnauthorized reports whether err is a 401/unauthorized from Alist.
-func IsUnauthorized(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	return strings.Contains(s, "code=401") || strings.Contains(s, "unauthorized") || strings.Contains(s, "not login")
+	return strings.Contains(s, "already exists") || strings.Contains(s, "already exist")
 }
 
 type ListItem struct {
@@ -258,12 +267,12 @@ type ListItem struct {
 }
 
 type ListResp struct {
-	Content []ListItem `json:"content"`
-	Total   int        `json:"total"`
-	Readme  string     `json:"readme"`
-	Header  string     `json:"header"`
-	Write   bool       `json:"write"`
-	Provider string    `json:"provider"`
+	Content  []ListItem `json:"content"`
+	Total    int        `json:"total"`
+	Readme   string     `json:"readme"`
+	Header   string     `json:"header"`
+	Write    bool       `json:"write"`
+	Provider string     `json:"provider"`
 }
 
 type ListOptions struct {
@@ -326,26 +335,38 @@ func (c *Client) ListAll(path string, perPage int, refresh bool) ([]ListItem, er
 }
 
 // ListRecursive walks remote tree depth-first, returning map dir -> items.
+// maxDepth <=0 means unlimited.
 func (c *Client) ListRecursive(root string, perPage int, refresh bool) (map[string][]ListItem, error) {
+	return c.ListRecursiveWithDepth(root, perPage, refresh, 0)
+}
+
+func (c *Client) ListRecursiveWithDepth(root string, perPage int, refresh bool, maxDepth int) (map[string][]ListItem, error) {
+	type entry struct {
+		dir   string
+		depth int
+	}
 	result := make(map[string][]ListItem)
-	queue := []string{root}
+	queue := []entry{{dir: root, depth: 0}}
 	visited := make(map[string]bool)
 	for len(queue) > 0 {
-		dir := queue[0]
+		e := queue[0]
 		queue = queue[1:]
-		if visited[dir] {
+		if visited[e.dir] {
 			continue
 		}
-		visited[dir] = true
-		items, err := c.ListAll(dir, perPage, refresh)
+		visited[e.dir] = true
+		items, err := c.ListAll(e.dir, perPage, refresh)
 		if err != nil {
-			return nil, fmt.Errorf("list %s: %w", dir, err)
+			return nil, fmt.Errorf("list %s: %w", e.dir, err)
 		}
-		result[dir] = items
+		result[e.dir] = items
+		if maxDepth > 0 && e.depth >= maxDepth {
+			continue
+		}
 		for _, it := range items {
 			if it.IsDir {
-				sub := strings.TrimRight(dir, "/") + "/" + it.Name
-				queue = append(queue, sub)
+				sub := strings.TrimRight(e.dir, "/") + "/" + it.Name
+				queue = append(queue, entry{dir: sub, depth: e.depth + 1})
 			}
 		}
 	}
@@ -356,25 +377,21 @@ func (c *Client) ListRecursive(root string, perPage int, refresh bool) (map[stri
 
 // UploadFile streams local file to remotePath via PUT /api/fs/put.
 // Alist expects headers: Authorization, File-Path (url-encoded), As-Task, Content-Type.
-// See: https://alist.nn.ci/guide/api.html#upload-file
 // If the token is expired (401), it auto re-logins using Username/Password and retries once.
 func (c *Client) UploadFile(localPath, remotePath string, asTask bool, overwrite bool) error {
-	return c.uploadFileWithRetry(localPath, remotePath, asTask, overwrite, true)
+	return c.UploadFileWithContext(context.Background(), localPath, remotePath, asTask, overwrite)
 }
 
-func (c *Client) uploadFileWithRetry(localPath, remotePath string, asTask bool, overwrite bool, allowRetry bool) error {
-	f, err := os.Open(localPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+func (c *Client) UploadFileWithContext(ctx context.Context, localPath, remotePath string, asTask bool, overwrite bool) error {
+	return c.uploadFileWithRetry(ctx, localPath, remotePath, asTask, overwrite, true)
+}
 
-	fi, err := f.Stat()
+func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath string, asTask bool, overwrite bool, allowRetry bool) error {
+	fi, err := os.Stat(localPath)
 	if err != nil {
 		return err
 	}
 
-	// ensure parent dir exists
 	parent := filepath.ToSlash(filepath.Dir(remotePath))
 	if parent != "/" && parent != "." {
 		if err := c.EnsureDir(parent); err != nil {
@@ -384,7 +401,19 @@ func (c *Client) uploadFileWithRetry(localPath, remotePath string, asTask bool, 
 
 	encodedPath := encodeFilePath(remotePath)
 
-	req, err := http.NewRequest("PUT", c.Host+"/api/fs/put", f)
+	f, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	// close on return; on retry we close explicitly before recursing
+	shouldClose := true
+	defer func() {
+		if shouldClose {
+			f.Close()
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, "PUT", c.Host+"/api/fs/put", f)
 	if err != nil {
 		return err
 	}
@@ -398,7 +427,7 @@ func (c *Client) uploadFileWithRetry(localPath, remotePath string, asTask bool, 
 		req.Header.Set("As-Task", "false")
 	}
 
-	httpClient := &http.Client{Timeout: 0}
+	uploadClient := &http.Client{Timeout: uploadTimeout}
 	var body io.ReadCloser = f
 	if !asTask && fi.Size() > 0 {
 		pr := &progressReader{Reader: f, total: fi.Size(), name: filepath.Base(localPath), start: time.Now()}
@@ -406,7 +435,7 @@ func (c *Client) uploadFileWithRetry(localPath, remotePath string, asTask bool, 
 	}
 	req.Body = body
 
-	resp, err := httpClient.Do(req)
+	resp, err := uploadClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -418,22 +447,26 @@ func (c *Client) uploadFileWithRetry(localPath, remotePath string, asTask bool, 
 	}
 	if r.Code != 200 {
 		if allowRetry && isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
-			fmt.Println("token expired, re-logging in ...")
-			if err := c.relogin(); err != nil {
+			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			if err := c.relogin(ctx); err != nil {
 				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", r.Code, r.Message, err)
 			}
-			// retry once — need to reopen file (previous reader consumed)
+			shouldClose = false
 			f.Close()
-			return c.uploadFileWithRetry(localPath, remotePath, asTask, overwrite, false)
+			return c.uploadFileWithRetry(ctx, localPath, remotePath, asTask, overwrite, false)
 		}
 		return fmt.Errorf("upload failed code=%d msg=%s body=%s", r.Code, r.Message, string(b))
 	}
-	fmt.Printf("\n")
+	fmt.Fprintln(os.Stderr)
 	return nil
 }
 
 // UploadDirRecursive uploads folder file-by-file preserving structure.
 func (c *Client) UploadDirRecursive(localDir, remoteDir string, asTask bool) (int, int64, error) {
+	return c.UploadDirRecursiveWithContext(context.Background(), localDir, remoteDir, asTask)
+}
+
+func (c *Client) UploadDirRecursiveWithContext(ctx context.Context, localDir, remoteDir string, asTask bool) (int, int64, error) {
 	var count int
 	var total int64
 	err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
@@ -443,14 +476,19 @@ func (c *Client) UploadDirRecursive(localDir, remoteDir string, asTask bool) (in
 		if info.IsDir() {
 			return nil
 		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		rel, err := filepath.Rel(localDir, path)
 		if err != nil {
 			return err
 		}
 		rel = filepath.ToSlash(rel)
 		remotePath := strings.TrimRight(remoteDir, "/") + "/" + rel
-		fmt.Printf("  [%d] %s -> %s (%d bytes)\n", count+1, rel, remotePath, info.Size())
-		if err := c.UploadFile(path, remotePath, asTask, true); err != nil {
+		fmt.Fprintf(os.Stderr, "  [%d] %s -> %s (%d bytes)\n", count+1, rel, remotePath, info.Size())
+		if err := c.UploadFileWithContext(ctx, path, remotePath, asTask, true); err != nil {
 			return fmt.Errorf("upload %s: %w", rel, err)
 		}
 		count++
@@ -461,7 +499,6 @@ func (c *Client) UploadDirRecursive(localDir, remoteDir string, asTask bool) (in
 }
 
 func encodeFilePath(p string) string {
-	// encode each segment, keep "/" separators
 	parts := strings.Split(p, "/")
 	for i, s := range parts {
 		if s == "" {
@@ -472,7 +509,7 @@ func encodeFilePath(p string) string {
 	return strings.Join(parts, "/")
 }
 
-// progressReader prints upload progress.
+// progressReader prints upload progress to stderr.
 type progressReader struct {
 	io.Reader
 	total   int64
@@ -488,7 +525,7 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	if pr.total > 0 {
 		pct := int(pr.read * 100 / pr.total)
 		if pct != pr.lastPct && pct%5 == 0 {
-			fmt.Printf("\r  %s: %d%% (%d/%d)", pr.name, pct, pr.read, pr.total)
+			fmt.Fprintf(os.Stderr, "\r  %s: %d%% (%d/%d)", pr.name, pct, pr.read, pr.total)
 			pr.lastPct = pct
 		}
 	}

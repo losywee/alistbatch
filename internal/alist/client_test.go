@@ -2,6 +2,7 @@ package alist
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -76,5 +77,75 @@ func TestLoginAndUpload(t *testing.T) {
 func TestEncodeFilePath(t *testing.T) {
 	if got := encodeFilePath("/a/b c/d.txt"); got != "/a/b%20c/d.txt" {
 		t.Errorf("encode = %q", got)
+	}
+}
+
+func TestEnsureDirIdempotent(t *testing.T) {
+	var mkdirCalls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/fs/mkdir":
+			var req map[string]string
+			json.NewDecoder(r.Body).Decode(&req)
+			mkdirCalls = append(mkdirCalls, req["path"])
+			// second call for /a simulates already exists
+			if req["path"] == "/a" && len(mkdirCalls) > 1 {
+				json.NewEncoder(w).Encode(map[string]any{"code": 400, "message": "already exists", "data": nil})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": nil})
+		case "/api/fs/list":
+			json.NewEncoder(w).Encode(map[string]any{"code": 200, "message": "success", "data": map[string]any{"content": []any{}, "total": 0}})
+		default:
+			t.Errorf("unexpected %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "tok")
+	if err := c.EnsureDir("/a/b/c"); err != nil {
+		t.Fatalf("EnsureDir: %v", err)
+	}
+	// should have tried /a, /a/b, /a/b/c
+	if len(mkdirCalls) < 3 {
+		t.Fatalf("mkdirCalls = %v", mkdirCalls)
+	}
+	// second EnsureDir should not fail even though /a already exists
+	mkdirCalls = nil
+	if err := c.EnsureDir("/a/b"); err != nil {
+		t.Fatalf("EnsureDir idempotent: %v", err)
+	}
+}
+
+func TestIsAlreadyExistsErr(t *testing.T) {
+	if !isAlreadyExistsErr(fmt.Errorf("already exists")) {
+		t.Error("already exists")
+	}
+	if !isAlreadyExistsErr(fmt.Errorf("Already Exists")) {
+		t.Error("Already Exists")
+	}
+	if isAlreadyExistsErr(fmt.Errorf("does not exist")) {
+		t.Error("should not match does not exist")
+	}
+	if isAlreadyExistsErr(fmt.Errorf("user exists")) {
+		t.Error("should not match user exists")
+	}
+}
+
+func TestIsUnauthorizedCode(t *testing.T) {
+	if !isUnauthorizedCode(401, "anything") {
+		t.Error("401")
+	}
+	if !isUnauthorizedCode(400, "unauthorized") {
+		t.Error("unauthorized")
+	}
+	if !isUnauthorizedCode(400, "Token Expired") {
+		t.Error("token expired")
+	}
+	if isUnauthorizedCode(400, "not found") {
+		t.Error("not found should not be unauthorized")
+	}
+	if !IsUnauthorized(fmt.Errorf("api POST /api/fs/list code=401 msg=unauthorized")) {
+		t.Error("IsUnauthorized")
 	}
 }

@@ -32,7 +32,7 @@ func (c *Config) Sanitized() *Config {
 }
 
 // Path returns config file path.
-// Priority: $ALIST_CONFIG > $XDG_CONFIG_HOME/alistbatch/config.json > ~/.config/alistbatch/config.json > ~/.alistbatch.json
+// Priority: $ALIST_CONFIG > UserConfigDir/alistbatch/config.json
 func Path() string {
 	if p := os.Getenv("ALIST_CONFIG"); p != "" {
 		return p
@@ -43,10 +43,6 @@ func Path() string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return "./alistbatch.json"
-	}
-	// fallback to ~/.config/alistbatch/config.json
-	if _, err := os.Stat(filepath.Join(home, ".config")); err == nil {
-		return filepath.Join(home, ".config", "alistbatch", "config.json")
 	}
 	return filepath.Join(home, ".alistbatch.json")
 }
@@ -82,9 +78,12 @@ func Save(c *Config) error {
 	if err != nil {
 		return err
 	}
-	// write atomically via temp file
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, b, 0600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0600); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, p)

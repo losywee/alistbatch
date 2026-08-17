@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"alistbatch/internal/alist"
@@ -84,7 +85,7 @@ Upload examples:
   alistbatch upload -s ./mydir -r /backup/mydir --no-zip
 
   # one-off with explicit host/token (no save)
-  alistbatch upload -H https://alist.example.com -t $TOKEN -s ./a.txt -r /a.txt
+  alistbatch upload -H https://alist.example.com -t $TOKEN -s ./a.txt -r /a.txt --save=false
 
 Pack examples:
   alistbatch pack ./mydir -o mydir.zip
@@ -113,8 +114,6 @@ type resolvedAuth struct {
 	Cfg      *config.Config
 }
 
-// resolveAuth merges flags > env > config file.
-// hostFlag/tokenFlag/etc are pointers to flag values (may be empty).
 func resolveAuth(hostFlag, tokenFlag, userFlag, passFlag string) (*resolvedAuth, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -143,9 +142,6 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// ensureClient returns an authenticated client, auto-logging in if needed.
-// It also wires auto re-login on 401: if any subsequent API call gets 401,
-// the client will re-login with Username/Password and retry once, persisting the new token.
 func ensureClient(a *resolvedAuth, save bool) (*alist.Client, error) {
 	if a.Host == "" {
 		return nil, fmt.Errorf("Alist host required (-H or ALIST_HOST or saved config). Run: alistbatch login -H <host> -u <user> -p <pass>")
@@ -154,7 +150,7 @@ func ensureClient(a *resolvedAuth, save bool) (*alist.Client, error) {
 	c.SetCredentials(a.Username, a.Password)
 	c.OnTokenRefresh = func(newToken string) {
 		_ = config.Update(a.Host, "", "", newToken)
-		fmt.Printf("token refreshed and saved to %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "token refreshed and saved to %s\n", config.Path())
 	}
 	if c.Token != "" {
 		return c, nil
@@ -162,20 +158,16 @@ func ensureClient(a *resolvedAuth, save bool) (*alist.Client, error) {
 	if a.Username == "" || a.Password == "" {
 		return nil, fmt.Errorf("token or username/password required (no saved credentials). Run: alistbatch login -H %s -u <user> -p <pass>", a.Host)
 	}
-	fmt.Printf("logging in to %s as %s ...\n", a.Host, a.Username)
+	fmt.Fprintf(os.Stderr, "logging in to %s as %s ...\n", a.Host, a.Username)
 	if err := c.Login(a.Username, a.Password); err != nil {
 		return nil, err
 	}
-	fmt.Println("login ok")
+	fmt.Fprintln(os.Stderr, "login ok")
 	if save {
 		if err := config.Update(a.Host, a.Username, a.Password, c.Token); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to save config: %v\n", err)
 		} else {
-			fmt.Printf("saved credentials to %s\n", config.Path())
-		}
-	} else {
-		if a.Cfg.Host == a.Host || a.Cfg.Host == "" {
-			_ = config.Update(a.Host, "", "", c.Token)
+			fmt.Fprintf(os.Stderr, "saved credentials to %s\n", config.Path())
 		}
 	}
 	return c, nil
@@ -251,17 +243,17 @@ func runUpload(args []string) {
 	}
 
 	if !fi.IsDir() {
-		fmt.Printf("uploading file %s -> %s\n", *src, *remote)
+		fmt.Fprintf(os.Stderr, "uploading file %s -> %s\n", *src, *remote)
 		if err := client.UploadFile(*src, *remote, *asTask, *overwrite); err != nil {
 			fmt.Fprintf(os.Stderr, "upload failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println("done")
+		fmt.Fprintln(os.Stderr, "done")
 		return
 	}
 
 	if *noZip {
-		fmt.Printf("uploading folder recursively %s -> %s\n", *src, *remote)
+		fmt.Fprintf(os.Stderr, "uploading folder recursively %s -> %s\n", *src, *remote)
 		if err := client.EnsureDir(*remote); err != nil {
 			fmt.Fprintf(os.Stderr, "mkdir %s: %v\n", *remote, err)
 			os.Exit(1)
@@ -271,11 +263,11 @@ func runUpload(args []string) {
 			fmt.Fprintf(os.Stderr, "upload dir failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("done: %d files, %s\n", count, humanBytes(bytes))
+		fmt.Fprintf(os.Stderr, "done: %d files, %s\n", count, humanBytes(bytes))
 		return
 	}
 
-	fmt.Printf("packing folder %s ...\n", *src)
+	fmt.Fprintf(os.Stderr, "packing folder %s ...\n", *src)
 	tmpZip, cleanup, err := pack.ZipFolderToTemp(*src)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pack failed: %v\n", err)
@@ -289,50 +281,48 @@ func runUpload(args []string) {
 		*remote += ".zip"
 	}
 	fi2, _ := os.Stat(tmpZip)
-	fmt.Printf("packed %s (%s) -> uploading to %s\n", tmpZip, humanBytes(fi2.Size()), *remote)
+	fmt.Fprintf(os.Stderr, "packed %s (%s) -> uploading to %s\n", tmpZip, humanBytes(fi2.Size()), *remote)
 	if err := client.UploadFile(tmpZip, *remote, *asTask, *overwrite); err != nil {
 		fmt.Fprintf(os.Stderr, "upload failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("done")
+	fmt.Fprintln(os.Stderr, "done")
 }
 
 func runPack(args []string) {
-	var out string
-	var src string
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "-o" || a == "--output" || a == "-output" {
-			if i+1 < len(args) {
-				out = args[i+1]
-				i++
-			}
-		} else if strings.HasPrefix(a, "-") {
-			fmt.Fprintf(os.Stderr, "unknown flag %s\n", a)
-			os.Exit(1)
-		} else {
-			if src == "" {
-				src = a
-			}
+	fs := flag.NewFlagSet("pack", flag.ExitOnError)
+	out := fs.String("o", "", "output zip path")
+	fs.String("output", "", "output zip path (alias for -o)")
+	fs.Parse(args)
+	// normalize long form manually for pack (flag package handles -output but not --output)
+	for i, a := range args {
+		if a == "--output" && i+1 < len(args) && *out == "" {
+			*out = args[i+1]
+		}
+		if strings.HasPrefix(a, "--output=") && *out == "" {
+			*out = strings.TrimPrefix(a, "--output=")
 		}
 	}
-	if src == "" {
+	rest := fs.Args()
+	if len(rest) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: alistbatch pack <folder|file> [-o output.zip]")
+		fs.Usage()
 		os.Exit(1)
 	}
-	if out == "" {
-		out = filepath.Base(strings.TrimRight(src, "/")) + ".zip"
-		if out == ".zip" {
-			out = "pack.zip"
+	src := rest[0]
+	if *out == "" {
+		*out = filepath.Base(strings.TrimRight(src, "/")) + ".zip"
+		if *out == ".zip" {
+			*out = "pack.zip"
 		}
 	}
-	fmt.Printf("packing %s -> %s\n", src, out)
-	if err := pack.ZipFolder(src, out); err != nil {
+	fmt.Fprintf(os.Stderr, "packing %s -> %s\n", src, *out)
+	if err := pack.ZipFolder(src, *out); err != nil {
 		fmt.Fprintf(os.Stderr, "pack failed: %v\n", err)
 		os.Exit(1)
 	}
-	fi, _ := os.Stat(out)
-	fmt.Printf("done: %s (%s)\n", out, humanBytes(fi.Size()))
+	fi, _ := os.Stat(*out)
+	fmt.Fprintf(os.Stderr, "done: %s (%s)\n", *out, humanBytes(fi.Size()))
 }
 
 func runLogin(args []string) {
@@ -354,7 +344,6 @@ func runLogin(args []string) {
 	if host == "" && len(rest) >= 1 {
 		host = rest[0]
 	}
-	// also allow env/config fallback for host
 	if host == "" {
 		host = os.Getenv("ALIST_HOST")
 	}
@@ -369,14 +358,13 @@ func runLogin(args []string) {
 	}
 	host = strings.TrimRight(host, "/")
 
-	// if token provided directly, just save it
 	if *tokenF != "" {
 		if !*noSave {
 			if err := config.Update(host, *usernameF, *passwordF, *tokenF); err != nil {
 				fmt.Fprintf(os.Stderr, "save config failed: %v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("saved token to %s\n", config.Path())
+			fmt.Fprintf(os.Stderr, "saved token to %s\n", config.Path())
 		}
 		fmt.Printf("token: %s\n", *tokenF)
 		return
@@ -384,14 +372,13 @@ func runLogin(args []string) {
 
 	username := *usernameF
 	password := *passwordF
-	// fallback to env/config for username/password if not flagged
 	if username == "" {
 		username = os.Getenv("ALIST_USERNAME")
 	}
 	if password == "" {
 		password = os.Getenv("ALIST_PASSWORD")
 	}
-	if (username == "" || password == "") {
+	if username == "" || password == "" {
 		if cfg, _ := config.Load(); cfg != nil {
 			if username == "" {
 				username = cfg.Username
@@ -417,8 +404,8 @@ func runLogin(args []string) {
 			fmt.Fprintf(os.Stderr, "save config failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("saved to %s\n", config.Path())
-		fmt.Printf("host=%s user=%s\n", host, username)
+		fmt.Fprintf(os.Stderr, "saved to %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "host=%s user=%s\n", host, username)
 	} else {
 		fmt.Printf("\nexport ALIST_HOST=%s\n", host)
 		fmt.Printf("export ALIST_TOKEN=%s\n", c.Token)
@@ -434,30 +421,35 @@ func runLogout(args []string) {
 			fmt.Fprintf(os.Stderr, "clear failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("cleared %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "cleared %s\n", config.Path())
 		return
 	}
 	if err := config.ClearToken(); err != nil {
 		fmt.Fprintf(os.Stderr, "clear token failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("cleared token in %s\n", config.Path())
+	fmt.Fprintf(os.Stderr, "cleared token in %s\n", config.Path())
 }
 
 func runConfig(args []string) {
-	// alistbatch config              -> show
-	// alistbatch config --host X     -> set host
-	// alistbatch config --clear      -> clear all
-	// alistbatch config --path       -> print path
+	args = normalizeArgs(args, map[string]string{
+		"--host":     "-H",
+		"--username": "-u",
+		"--password": "-p",
+		"--token":    "-t",
+		"--clear":    "-clear",
+		"--path":     "-path",
+		"--json":     "-json",
+	})
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	hostF := fs.String("H", "", "set host")
-	_ = fs.String("host", "", "")
+	fs.String("host", "", "set host")
 	usernameF := fs.String("u", "", "set username")
-	_ = fs.String("username", "", "")
+	fs.String("username", "", "set username")
 	passwordF := fs.String("p", "", "set password")
-	_ = fs.String("password", "", "")
+	fs.String("password", "", "set password")
 	tokenF := fs.String("t", "", "set token")
-	_ = fs.String("token", "", "")
+	fs.String("token", "", "set token")
 	clear := fs.Bool("clear", false, "clear config file")
 	showPath := fs.Bool("path", false, "print config file path")
 	jsonOut := fs.Bool("json", false, "output as JSON")
@@ -472,31 +464,15 @@ func runConfig(args []string) {
 			fmt.Fprintf(os.Stderr, "clear failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("cleared %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "cleared %s\n", config.Path())
 		return
 	}
-	// if any set flag provided, update
 	if *hostF != "" || *usernameF != "" || *passwordF != "" || *tokenF != "" {
-		// also handle long forms via normalize
-		for i, a := range os.Args {
-			if a == "--host" && i+1 < len(os.Args) {
-				*hostF = os.Args[i+1]
-			}
-			if a == "--username" && i+1 < len(os.Args) {
-				*usernameF = os.Args[i+1]
-			}
-			if a == "--password" && i+1 < len(os.Args) {
-				*passwordF = os.Args[i+1]
-			}
-			if a == "--token" && i+1 < len(os.Args) {
-				*tokenF = os.Args[i+1]
-			}
-		}
 		if err := config.Update(*hostF, *usernameF, *passwordF, *tokenF); err != nil {
 			fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("updated %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "updated %s\n", config.Path())
 	}
 
 	cfg, err := config.Load()
@@ -564,7 +540,7 @@ func runMkdir(args []string) {
 		fmt.Fprintf(os.Stderr, "mkdir failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("ok")
+	fmt.Fprintln(os.Stderr, "ok")
 }
 
 func runList(args []string) {
@@ -615,11 +591,10 @@ func runList(args []string) {
 	c.SetCredentials(auth.Username, auth.Password)
 	c.OnTokenRefresh = func(newToken string) {
 		_ = config.Update(auth.Host, "", "", newToken)
-		fmt.Printf("token refreshed and saved to %s\n", config.Path())
+		fmt.Fprintf(os.Stderr, "token refreshed and saved to %s\n", config.Path())
 	}
-	// if no token but have credentials, login now
 	if c.Token == "" && c.Username != "" && c.Password != "" {
-		fmt.Printf("logging in to %s as %s ...\n", auth.Host, c.Username)
+		fmt.Fprintf(os.Stderr, "logging in to %s as %s ...\n", auth.Host, c.Username)
 		if err := c.Login(c.Username, c.Password); err != nil {
 			fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
 			os.Exit(1)
@@ -642,13 +617,7 @@ func runList(args []string) {
 			for d := range tree {
 				dirs = append(dirs, d)
 			}
-			for i := 0; i < len(dirs); i++ {
-				for j := i + 1; j < len(dirs); j++ {
-					if dirs[j] < dirs[i] {
-						dirs[i], dirs[j] = dirs[j], dirs[i]
-					}
-				}
-			}
+			sort.Strings(dirs)
 			for _, d := range dirs {
 				items := tree[d]
 				fmt.Printf("%s (%d items):\n", d, len(items))
@@ -743,23 +712,16 @@ func normalizeArgs(args []string, mapping map[string]string) []string {
 	return out
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
 func humanBytes(n int64) string {
 	const unit = 1024
 	if n < unit {
 		return fmt.Sprintf("%d B", n)
 	}
 	div, exp := int64(unit), 0
-	for n >= div*unit && exp < 4 {
+	for n >= div*unit && exp < 5 {
 		div *= unit
 		exp++
 	}
-	units := []string{"KB", "MB", "GB", "TB"}
+	units := []string{"KB", "MB", "GB", "TB", "PB"}
 	return fmt.Sprintf("%.1f %s", float64(n)/float64(div), units[exp])
 }
