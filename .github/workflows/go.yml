@@ -1,28 +1,168 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Go
+name: Build
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main, master]
+    tags: ["v*"]
   pull_request:
-    branches: [ "main" ]
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: "386"
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          # windows
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: "386"
+          - goos: windows
+            goarch: arm64
+          # macos
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.20'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
 
-    - name: Build
-      run: go build -v ./...
+      - name: Vet and test (native)
+        run: |
+          go vet ./...
+          go test ./... -count=1
 
-    - name: Test
-      run: go test -v ./...
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          fi
+          echo "VERSION=$VERSION"
+          BIN="alistbatch"
+          if [ "${{ matrix.goos }}" = "windows" ]; then BIN="${BIN}.exe"; fi
+          OUTDIR="dist"
+          mkdir -p "${OUTDIR}"
+          # asset name: alistbatch_<os>_<arch>[<goarm>]  (x86=386, x64=amd64, arm=arm/arm64)
+          ARCH="${{ matrix.goarch }}"
+          SUFFIX=""
+          if [ "${{ matrix.goarch }}" = "arm" ] && [ -n "${{ matrix.goarm }}" ]; then
+            SUFFIX="v${{ matrix.goarm }}"
+          fi
+          ASSET="alistbatch-${{ matrix.goos }}-${ARCH}${SUFFIX}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then ASSET="${ASSET}.exe"; fi
+          echo "Building ${ASSET} (GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }}) version=${VERSION}"
+          go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o "${OUTDIR}/${ASSET}" .
+          ls -lh "${OUTDIR}/${ASSET}"
+          # also keep generic per-OS name for convenience
+          cp "${OUTDIR}/${ASSET}" "${OUTDIR}/${BIN}" 2>/dev/null || true
+          # checksum
+          (cd "${OUTDIR}" && sha256sum "${ASSET}" > "${ASSET}.sha256" || shasum -a 256 "${ASSET}" > "${ASSET}.sha256")
+          cat "${OUTDIR}/${ASSET}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alistbatch-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
+          path: |
+            dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  tinygo-wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go for TinyGo
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Setup TinyGo
+        uses: acifani/setup-tinygo@v2
+        with:
+          tinygo-version: "0.33.0"
+
+      - name: Build WASM with TinyGo
+        run: |
+          set -o pipefail
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          if [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          fi
+          echo "VERSION=$VERSION"
+          mkdir -p dist
+          # TinyGo only supports wasm/wasi; native net/http+TLS+archive/zip are not supported,
+          # so this is an experimental wasm artifact (may fail if stdlib gaps hit).
+          tinygo version
+          if ! tinygo build -target wasm -o dist/alistbatch.wasm -ldflags "-X main.version=${VERSION}" . 2>&1 | tee dist/tinygo-wasm.log; then
+            echo "::warning::TinyGo wasm build failed (expected for net/http+TLS+archive/zip) — see dist/tinygo-wasm.log"
+            echo "tinygo wasm build failed" > dist/alistbatch.wasm.failed
+            cat dist/tinygo-wasm.log
+            exit 0
+          fi
+          ls -lh dist/alistbatch.wasm
+          (cd dist && sha256sum alistbatch.wasm > alistbatch.wasm.sha256 || shasum -a 256 alistbatch.wasm > alistbatch.wasm.sha256)
+          cat dist/alistbatch.wasm.sha256
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alistbatch-wasm
+          path: |
+            dist/alistbatch.wasm*
+            dist/tinygo-wasm.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -R dist && sha256sum dist/* 2>/dev/null || shasum -a 256 dist/*
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false
