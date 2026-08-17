@@ -73,8 +73,9 @@ func Save(c *Config) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	// tighten perms if dir already existed with looser mode
-	_ = os.Chmod(dir, 0700)
+	if dir != "." && dir != "/" {
+		_ = os.Chmod(dir, 0700)
+	}
 	c.Host = strings.TrimRight(strings.TrimSpace(c.Host), "/")
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {

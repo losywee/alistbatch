@@ -46,6 +46,14 @@ type Client struct {
 	mu sync.RWMutex // protects Token
 }
 
+var stderrMu sync.Mutex
+
+func logf(format string, args ...any) {
+	stderrMu.Lock()
+	defer stderrMu.Unlock()
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
 // uploadClient returns an http.Client with no timeout but shared Transport for pooling.
 func (c *Client) uploadClient() *http.Client {
 	if c.HTTPClient != nil && c.HTTPClient.Transport != nil {
@@ -75,9 +83,17 @@ func (e UploadError) Error() string { return fmt.Sprintf("%s: %v", e.Rel, e.Err)
 
 // UploadDirOptions controls batch folder upload.
 type UploadDirOptions struct {
-	AsTask     bool
-	Concurrency int
-	SkipErrors bool
+	AsTask       bool
+	Concurrency  int
+	SkipErrors   bool
+	SkipExisting bool // skip files that already exist on remote (checked via List)
+}
+
+type job struct {
+	localPath  string
+	remotePath string
+	size       int64
+	rel        string
 }
 
 // SetCredentials sets username/password for auto re-login on 401.
@@ -258,7 +274,7 @@ func IsUnauthorized(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "code=401") || strings.Contains(s, "unauthorized") || strings.Contains(s, "not login") || strings.Contains(s, "token expired")
+	return strings.Contains(s, "code=401") || strings.Contains(s, "unauthorized") || strings.Contains(s, "not login") || strings.Contains(s, "token expired") || strings.Contains(s, "please login")
 }
 
 // ---------- fs ops ----------
@@ -270,6 +286,11 @@ func (c *Client) Mkdir(path string) error {
 
 // EnsureDir creates all parent dirs (mkdir -p).
 func (c *Client) EnsureDir(dir string) error {
+	return c.EnsureDirWithContext(context.Background(), dir)
+}
+
+// EnsureDirWithContext is like EnsureDir but respects ctx.
+func (c *Client) EnsureDirWithContext(ctx context.Context, dir string) error {
 	dir = filepath.ToSlash(dir)
 	dir = strings.TrimRight(dir, "/")
 	if dir == "" || dir == "/" {
@@ -278,12 +299,17 @@ func (c *Client) EnsureDir(dir string) error {
 	parts := strings.Split(strings.TrimPrefix(dir, "/"), "/")
 	cur := ""
 	for _, p := range parts {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		cur += "/" + p
-		if err := c.Mkdir(cur); err != nil {
+		if err := c.MkdirWithContext(ctx, cur); err != nil {
 			if isAlreadyExistsErr(err) {
 				continue
 			}
-			if _, lerr := c.List(cur); lerr == nil {
+			if _, lerr := c.ListWithContext(ctx, cur); lerr == nil {
 				continue
 			}
 			return err
@@ -294,7 +320,80 @@ func (c *Client) EnsureDir(dir string) error {
 
 func isAlreadyExistsErr(err error) bool {
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "already exists") || strings.Contains(s, "already exist")
+	if strings.Contains(s, "already exists") || strings.Contains(s, "already exist") {
+		return true
+	}
+	if strings.Contains(s, "已存在") {
+		return true
+	}
+	return false
+}
+
+// MkdirWithContext is like Mkdir but with ctx.
+func (c *Client) MkdirWithContext(ctx context.Context, path string) error {
+	_, err := c.doJSONWithContext(ctx, "POST", "/api/fs/mkdir", map[string]string{"path": path}, true)
+	return err
+}
+
+// ListWithContext is like ListWithOptions but with explicit ctx.
+func (c *Client) ListWithContext(ctx context.Context, path string) (*ListResp, error) {
+	return c.ListWithOptionsAndContext(ctx, path, ListOptions{Page: 1, PerPage: 100})
+}
+
+// ListWithOptionsAndContext is like ListWithOptions but with ctx.
+func (c *Client) ListWithOptionsAndContext(ctx context.Context, path string, opts ListOptions) (*ListResp, error) {
+	if opts.Page == 0 {
+		opts.Page = 1
+	}
+	if opts.PerPage == 0 {
+		opts.PerPage = 100
+	}
+	r, err := c.doJSONWithContext(ctx, "POST", "/api/fs/list", map[string]any{
+		"path":     path,
+		"password": opts.Password,
+		"page":     opts.Page,
+		"per_page": opts.PerPage,
+		"refresh":  opts.Refresh,
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	var data ListResp
+	if err := json.Unmarshal(r.Data, &data); err != nil {
+		return nil, err
+	}
+	return &data, nil
+}
+
+// Exists checks if remotePath exists (file or dir) via List of parent.
+func (c *Client) Exists(remotePath string) (bool, error) {
+	return c.ExistsWithContext(context.Background(), remotePath)
+}
+
+// ExistsWithContext checks existence with ctx.
+func (c *Client) ExistsWithContext(ctx context.Context, remotePath string) (bool, error) {
+	remotePath = filepath.ToSlash(remotePath)
+	remotePath = strings.TrimRight(remotePath, "/")
+	if remotePath == "" || remotePath == "/" {
+		return true, nil
+	}
+	dir := filepath.ToSlash(filepath.Dir(remotePath))
+	base := filepath.Base(remotePath)
+	// List parent dir and look for base
+	resp, err := c.ListWithContext(ctx, dir)
+	if err != nil {
+		// if parent doesn't exist, then file doesn't exist
+		if strings.Contains(strings.ToLower(err.Error()), "not found") || strings.Contains(strings.ToLower(err.Error()), "object not found") {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, it := range resp.Content {
+		if it.Name == base {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 type ListItem struct {
@@ -355,13 +454,18 @@ func (c *Client) ListWithOptions(path string, opts ListOptions) (*ListResp, erro
 
 // ListAll fetches all pages for a path.
 func (c *Client) ListAll(path string, perPage int, refresh bool) ([]ListItem, error) {
+	return c.ListAllWithContext(context.Background(), path, perPage, refresh)
+}
+
+// ListAllWithContext is like ListAll but with ctx.
+func (c *Client) ListAllWithContext(ctx context.Context, path string, perPage int, refresh bool) ([]ListItem, error) {
 	if perPage <= 0 {
 		perPage = 100
 	}
 	var all []ListItem
 	page := 1
 	for {
-		resp, err := c.ListWithOptions(path, ListOptions{Page: page, PerPage: perPage, Refresh: refresh})
+		resp, err := c.ListWithOptionsAndContext(ctx, path, ListOptions{Page: page, PerPage: perPage, Refresh: refresh})
 		if err != nil {
 			return nil, err
 		}
@@ -443,7 +547,7 @@ func (c *Client) putStreamWithRetry(ctx context.Context, r io.Reader, size int64
 	}
 	parent := filepath.ToSlash(filepath.Dir(remotePath))
 	if parent != "/" && parent != "." {
-		if err := c.EnsureDir(parent); err != nil {
+		if err := c.EnsureDirWithContext(ctx, parent); err != nil {
 			return fmt.Errorf("ensure dir %s: %w", parent, err)
 		}
 	}
@@ -478,18 +582,20 @@ func (c *Client) putStreamWithRetry(ctx context.Context, r io.Reader, size int64
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("upload read body: %w status=%d", err, resp.StatusCode)
+	}
 	var ar apiResp
 	if err := json.Unmarshal(b, &ar); err != nil {
 		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
 	}
 	if ar.Code != 200 {
 		if allowRetry && isUnauthorizedCode(ar.Code, ar.Message) && c.canRelogin() {
-			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			logf("token expired, re-logging in ...\n")
 			if err := c.relogin(ctx); err != nil {
 				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", ar.Code, ar.Message, err)
 			}
-			// retry only if seekable
 			if seeker, ok := r.(io.Seeker); ok {
 				if _, err := seeker.Seek(0, io.SeekStart); err != nil {
 					return fmt.Errorf("upload failed code=%d msg=%s (seek for retry failed: %v)", ar.Code, ar.Message, err)
@@ -561,6 +667,12 @@ func (c *Client) PutFolderWithOptions(ctx context.Context, localDir, remotePath 
 }
 
 func (c *Client) putFolderAsZipStream(ctx context.Context, localDir, remotePath string, opts PutStreamOptions) error {
+	// For 401 retry, pipe is non-seekable. So we handle retry at this level
+	// by re-generating the zip stream.
+	return c.putFolderAsZipStreamWithRetry(ctx, localDir, remotePath, opts, true)
+}
+
+func (c *Client) putFolderAsZipStreamWithRetry(ctx context.Context, localDir, remotePath string, opts PutStreamOptions, allowRetry bool) error {
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
 	go func() {
@@ -570,17 +682,20 @@ func (c *Client) putFolderAsZipStream(ctx context.Context, localDir, remotePath 
 			errCh <- err
 			return
 		}
-		// Close zip writer flush is inside ZipFolderToWriter; just close pipe.
 		pw.Close()
 		errCh <- nil
 	}()
 
-	putErr := c.PutStream(ctx, pr, -1, remotePath, opts)
+	putErr := c.putStreamWithRetry(ctx, pr, -1, remotePath, opts, allowRetry)
 	if putErr != nil {
-		// Unblock zip goroutine if PutStream fails early (reader gone, writer blocks).
 		pr.Close()
 	}
 	zipErr := <-errCh
+	// Pipe is non-seekable: putStreamWithRetry already re-logged in and returned
+	// "cannot retry non-seekable" on 401. Retry whole zip with fresh pipe.
+	if putErr != nil && allowRetry && strings.Contains(putErr.Error(), "cannot retry non-seekable") {
+		return c.putFolderAsZipStreamWithRetry(ctx, localDir, remotePath, opts, false)
+	}
 	if putErr != nil {
 		return putErr
 	}
@@ -608,7 +723,7 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 
 	parent := filepath.ToSlash(filepath.Dir(remotePath))
 	if parent != "/" && parent != "." {
-		if err := c.EnsureDir(parent); err != nil {
+		if err := c.EnsureDirWithContext(ctx, parent); err != nil {
 			return fmt.Errorf("ensure dir %s: %w", parent, err)
 		}
 	}
@@ -652,14 +767,17 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("upload read body: %w status=%d", err, resp.StatusCode)
+	}
 	var r apiResp
 	if err := json.Unmarshal(b, &r); err != nil {
 		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
 	}
 	if r.Code != 200 {
 		if allowRetry && isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
-			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			logf("token expired, re-logging in ...\n")
 			if err := c.relogin(ctx); err != nil {
 				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", r.Code, r.Message, err)
 			}
@@ -669,7 +787,7 @@ func (c *Client) uploadFileWithRetry(ctx context.Context, localPath, remotePath 
 		}
 		return fmt.Errorf("upload failed code=%d msg=%s body=%s", r.Code, r.Message, string(b))
 	}
-	fmt.Fprintln(os.Stderr)
+	logf("\n")
 	return nil
 }
 
@@ -710,12 +828,6 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 		return c.uploadDirSequentialWithOptions(ctx, localDir, remoteDir, opts)
 	}
 
-	type job struct {
-		localPath  string
-		remotePath string
-		size       int64
-		rel        string
-	}
 	var jobs []job
 	if err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -740,24 +852,45 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].rel < jobs[j].rel })
 
-	if err := c.EnsureDir(remoteDir); err != nil {
+	if err := c.EnsureDirWithContext(ctx, remoteDir); err != nil {
 		return 0, 0, nil, fmt.Errorf("ensure dir %s: %w", remoteDir, err)
 	}
+	// Collect unique parent dirs, including all ancestors to dedup EnsureDir calls.
 	seen := make(map[string]bool)
 	for _, j := range jobs {
 		dir := filepath.ToSlash(filepath.Dir(j.remotePath))
-		if dir != "/" && dir != "." && !seen[dir] {
-			seen[dir] = true
+		for dir != "/" && dir != "." && dir != remoteDir {
+			if !seen[dir] {
+				seen[dir] = true
+			}
+			dir = filepath.ToSlash(filepath.Dir(dir))
 		}
 	}
+	// Also ensure remoteDir itself already done; seen contains subdirs only.
 	var dirs []string
 	for d := range seen {
 		dirs = append(dirs, d)
 	}
 	sort.Slice(dirs, func(i, j int) bool { return strings.Count(dirs[i], "/") < strings.Count(dirs[j], "/") })
 	for _, d := range dirs {
-		if err := c.EnsureDir(d); err != nil {
+		if err := c.EnsureDirWithContext(ctx, d); err != nil {
 			return 0, 0, nil, fmt.Errorf("ensure dir %s: %w", d, err)
+		}
+	}
+
+	// Filter SkipExisting after EnsureDir so parent dirs exist and List is authoritative.
+	// Track which parent dirs were successfully listed to avoid redundant per-file Exists.
+	var okDirs map[string]bool
+	if opts.SkipExisting {
+		origCount := len(jobs)
+		var skipped int
+		jobs, skipped, okDirs = c.filterExistingJobs(ctx, jobs)
+		if len(jobs) == 0 {
+			logf("all %d files already exist, skipping\n", origCount)
+			return 0, 0, nil, nil
+		}
+		if skipped > 0 {
+			logf("skip-existing: %d/%d files already exist, %d remaining\n", skipped, origCount, len(jobs))
 		}
 	}
 
@@ -770,6 +903,7 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 	var count atomic.Int64
 	var total atomic.Int64
 	var completed atomic.Int64
+	var skipped atomic.Int64
 	var failedMu sync.Mutex
 	var failed []UploadError
 
@@ -781,13 +915,25 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 				return
 			default:
 			}
+			// SkipExisting fallback per file: only when batch List for this parent dir failed.
+			if opts.SkipExisting && okDirs != nil {
+				dir := filepath.ToSlash(filepath.Dir(j.remotePath))
+				if !okDirs[dir] {
+					if exists, err := c.ExistsWithContext(ctx, j.remotePath); err == nil && exists {
+						n := completed.Add(1)
+						skipped.Add(1)
+						logf("  [%d/%d] %s -> %s exists, skipped\n", n, len(jobs), j.rel, j.remotePath)
+						continue
+					}
+				}
+			}
 			if err := c.uploadFileDirect(ctx, j.localPath, j.remotePath, opts.AsTask); err != nil {
 				if opts.SkipErrors {
 					failedMu.Lock()
 					failed = append(failed, UploadError{Rel: j.rel, Err: err})
 					failedMu.Unlock()
 					n := completed.Add(1)
-					fmt.Fprintf(os.Stderr, "  [%d/%d] %s -> %s FAILED: %v (skipped)\n", n, len(jobs), j.rel, j.remotePath, err)
+					logf("  [%d/%d] %s -> %s FAILED: %v (skipped)\n", n, len(jobs), j.rel, j.remotePath, err)
 					continue
 				}
 				select {
@@ -800,7 +946,7 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 			count.Add(1)
 			total.Add(j.size)
 			n := completed.Add(1)
-			fmt.Fprintf(os.Stderr, "  [%d/%d] %s -> %s (%d bytes) done\n", n, len(jobs), j.rel, j.remotePath, j.size)
+			logf("  [%d/%d] %s -> %s (%d bytes) done\n", n, len(jobs), j.rel, j.remotePath, j.size)
 		}
 	}
 
@@ -827,11 +973,6 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 	}()
 
 	wg.Wait()
-	select {
-	case err := <-errCh:
-		return int(count.Load()), total.Load(), failed, err
-	default:
-	}
 	if err := ctx.Err(); err != nil && err != context.Canceled {
 		return int(count.Load()), total.Load(), failed, err
 	}
@@ -841,6 +982,53 @@ func (c *Client) UploadDirConcurrentWithOptions(ctx context.Context, localDir, r
 	default:
 		return int(count.Load()), total.Load(), failed, nil
 	}
+}
+
+// filterExistingJobs batches List calls per parent dir to filter out existing files.
+// Returns filtered jobs, number skipped, and set of dirs that were successfully listed.
+func (c *Client) filterExistingJobs(ctx context.Context, jobs []job) ([]job, int, map[string]bool) {
+	byDir := make(map[string][]int)
+	for i, j := range jobs {
+		dir := filepath.ToSlash(filepath.Dir(j.remotePath))
+		byDir[dir] = append(byDir[dir], i)
+	}
+	existsSet := make(map[int]bool)
+	okDirs := make(map[string]bool)
+	for dir, idxs := range byDir {
+		select {
+		case <-ctx.Done():
+			return jobs, 0, nil
+		default:
+		}
+		// Use ListAll to handle pagination (perPage 100 may miss files)
+		items, err := c.ListAllWithContext(ctx, dir, 200, false)
+		if err != nil {
+			continue
+		}
+		okDirs[dir] = true
+		nameSet := make(map[string]bool, len(items))
+		for _, it := range items {
+			nameSet[it.Name] = true
+		}
+		for _, idx := range idxs {
+			base := filepath.Base(jobs[idx].remotePath)
+			if nameSet[base] {
+				existsSet[idx] = true
+			}
+		}
+	}
+	if len(existsSet) == 0 {
+		return jobs, 0, okDirs
+	}
+	filtered := make([]job, 0, len(jobs)-len(existsSet))
+	for i, j := range jobs {
+		if existsSet[i] {
+			logf("  %s -> %s exists, skipped\n", j.rel, j.remotePath)
+			continue
+		}
+		filtered = append(filtered, j)
+	}
+	return filtered, len(existsSet), okDirs
 }
 
 func (c *Client) uploadDirSequential(ctx context.Context, localDir, remoteDir string, asTask bool) (int, int64, error) {
@@ -861,6 +1049,7 @@ func (c *Client) uploadDirSequentialWithOptions(ctx context.Context, localDir, r
 	var count int
 	var total int64
 	var failed []UploadError
+	var skipped int
 	err := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -879,10 +1068,18 @@ func (c *Client) uploadDirSequentialWithOptions(ctx context.Context, localDir, r
 		}
 		rel = filepath.ToSlash(rel)
 		remotePath := strings.TrimRight(remoteDir, "/") + "/" + rel
-		fmt.Fprintf(os.Stderr, "  [%d] %s -> %s (%d bytes)\n", count+1+len(failed), rel, remotePath, info.Size())
+		if opts.SkipExisting {
+			exists, err := c.ExistsWithContext(ctx, remotePath)
+			if err == nil && exists {
+				skipped++
+				logf("  [%d] %s -> %s exists, skipped\n", count+len(failed)+skipped, rel, remotePath)
+				return nil
+			}
+		}
+		logf("  [%d] %s -> %s (%d bytes)\n", count+len(failed)+skipped+1, rel, remotePath, info.Size())
 		if err := c.UploadFileWithContext(ctx, path, remotePath, opts.AsTask, true); err != nil {
 			if opts.SkipErrors {
-				fmt.Fprintf(os.Stderr, "  %s FAILED: %v (skipped)\n", rel, err)
+				logf("  %s FAILED: %v (skipped)\n", rel, err)
 				failed = append(failed, UploadError{Rel: rel, Err: err})
 				return nil
 			}
@@ -935,14 +1132,17 @@ func (c *Client) uploadFileDirect(ctx context.Context, localPath, remotePath str
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("upload read body: %w status=%d", err, resp.StatusCode)
+	}
 	var r apiResp
 	if err := json.Unmarshal(b, &r); err != nil {
 		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
 	}
 	if r.Code != 200 {
 		if isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
-			fmt.Fprintln(os.Stderr, "token expired, re-logging in ...")
+			logf("token expired, re-logging in ...\n")
 			if err := c.relogin(ctx); err != nil {
 				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", r.Code, r.Message, err)
 			}
@@ -982,7 +1182,9 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	if pr.total > 0 {
 		pct := int(pr.read * 100 / pr.total)
 		if pct != pr.lastPct && pct%5 == 0 {
+			stderrMu.Lock()
 			fmt.Fprintf(os.Stderr, "\r  %s: %d%% (%d/%d)", pr.name, pct, pr.read, pr.total)
+			stderrMu.Unlock()
 			pr.lastPct = pct
 		}
 	}

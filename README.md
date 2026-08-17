@@ -10,7 +10,7 @@ go build -o alistbatch .
 go install ./...
 ```
 
-Requires Go 1.21+.
+Requires Go 1.22+ (`toolchain go1.22.0`).
 
 ## Quick start
 
@@ -35,7 +35,7 @@ Requires Go 1.21+.
 - `login` saves `host`, `username`, `password`, `token` to config file (0600, via `internal/config`).
 - Every command resolves credentials as **flags > env vars > config file**.
 - If `token` is missing, the client auto-logs in with `username`/`password` and saves the new token.
-- If any API call returns **401** (token expired), the client auto re-logs in, updates the config file via `OnTokenRefresh`, and **retries once** — transparent to the caller. Works for `ls`, `mkdir`, `upload` (including `PUT /api/fs/put` which reopens the file on retry).
+- If any API call returns **401** (token expired), the client auto re-logs in, updates the config file via `OnTokenRefresh`, and **retries once** — transparent to the caller. Works for `ls`, `mkdir`, `upload` (including `PUT /api/fs/put` which reopens the file on retry; `put --zip` re-generates the zip stream on retry).
 
 Override config path with `$ALIST_CONFIG`:
 
@@ -47,8 +47,9 @@ ALIST_CONFIG=/tmp/my.json ./alistbatch login -H https://example.com -u admin -p 
 
 | Command | Description |
 |---------|-------------|
-| `upload` | Upload file or folder |
-| `pack`   | Zip a folder/file locally |
+| `upload` | Upload file or folder (single file or `--no-zip` batch) |
+| `put` | Stream upload via `PUT /api/fs/put` (file, stdin, or folder) |
+| `pack`   | Zip a folder/file locally (`-o` / `--output`) |
 | `login`  | `POST /api/auth/login` → save to config |
 | `logout` | Clear token (`--all` clears everything) |
 | `config` | Show / set config (`--json`, `--path`, `--clear`) |
@@ -59,18 +60,25 @@ ALIST_CONFIG=/tmp/my.json ./alistbatch login -H https://example.com -u admin -p 
 ## Flags
 
 ```
--H, --host      Alist host, e.g. https://alist.example.com (or $ALIST_HOST)
--u, --username  Username (or $ALIST_USERNAME)
--p, --password  Password (or $ALIST_PASSWORD)
--t, --token     Token, skips login (or $ALIST_TOKEN)
--s, --src       Local file/folder path (or 1st positional arg)
--r, --remote    Remote Alist path, e.g. /a/b.zip (or 2nd positional arg)
-    --no-zip    Upload folder recursively instead of zipping
-    --as-task   Set header As-Task:true (for large files)
-    --save      Save credentials after login (default true, use --save=false to disable)
+-H, --host       Alist host, e.g. https://alist.example.com (or $ALIST_HOST)
+-u, --username   Username (or $ALIST_USERNAME)
+-p, --password   Password (or $ALIST_PASSWORD)
+-t, --token      Token, skips login (or $ALIST_TOKEN)
+-s, --src        Local file/folder path (or 1st positional arg)
+-r, --remote     Remote Alist path, e.g. /a/b.zip (or 2nd positional arg)
+    --no-zip     Upload folder recursively instead of zipping
+    --zip        (put only) Zip folder and stream as single zip
+    --as-task    Set header As-Task:true (for large files)
+    --save       Save credentials after login (default true, use --save=false to disable)
+-c, --concurrency  Concurrent uploads for folder --no-zip (default 1 for upload, 4 for put, capped at 32)
+    --skip-errors    Skip failed files and continue (batch upload, exit 2 if any skipped)
+    --skip-existing  Skip files that already exist on remote (checked via List, batch + single file)
+                     Aliases: --skip-exists, --exists-skip, --continue-on-error (for skip-errors)
 ```
 
 `ls` flags: `-l` (long), `-R` (recursive), `--json`, `-f` (refresh), `--page`, `--per-page`.
+
+`pack` flags: `-o` / `--output` output zip path.
 
 ## Examples
 
@@ -83,6 +91,22 @@ ALIST_CONFIG=/tmp/my.json ./alistbatch login -H https://example.com -u admin -p 
 
 # large file as background task
 ./alistbatch upload -s ./big.iso -r /iso/big.iso --as-task
+
+# batch upload: skip existing + skip errors, concurrent
+./alistbatch upload -s ./mydir -r /backup/mydir --no-zip -c 8 --skip-existing --skip-errors
+./alistbatch put -r /remote/dir ./localdir --no-zip -c 8 --skip-existing --skip-errors
+
+# single file: skip if exists
+./alistbatch upload -s ./a.txt -r /a.txt --skip-existing
+./alistbatch put -r /remote/a.txt ./a.txt --skip-existing
+
+# stdin streaming
+./alistbatch put -r /remote/file.txt --stdin < file.txt
+cat file.txt | ./alistbatch put -r /remote/file.txt --stdin
+echo "hello" | ./alistbatch put -r /remote/hello.txt --stdin --content-type text/plain
+
+# folder as zip stream (no temp file)
+./alistbatch put -r /remote/dir.zip ./localdir --zip
 
 # list
 ./alistbatch ls /photos --long
@@ -97,12 +121,14 @@ ALIST_CONFIG=/tmp/my.json ./alistbatch login -H https://example.com -u admin -p 
 ./alistbatch logout --all        # clear all
 ```
 
+Exit codes: `0` success, `1` fatal error, `2` batch completed with skipped failures (`--skip-errors`).
+
 ## Alist API used
 
 - `POST /api/auth/login` — login
 - `PUT  /api/fs/put` — stream upload (headers: `Authorization`, `File-Path`, `As-Task`)
 - `POST /api/fs/mkdir` — create remote dirs
-- `POST /api/fs/list` — list / check existence
+- `POST /api/fs/list` — list / check existence (used for `--skip-existing` and `EnsureDir`)
 
 `File-Path` is URL-encoded per-segment, `Authorization` is the raw token (no `Bearer` prefix) per Alist docs.
 
@@ -110,10 +136,10 @@ ALIST_CONFIG=/tmp/my.json ./alistbatch login -H https://example.com -u admin -p 
 
 ```
 .
-├── main.go                 # CLI (upload/pack/login/logout/config/mkdir/ls)
+├── main.go                 # CLI (upload/put/pack/login/logout/config/mkdir/ls)
 ├── internal/
-│   ├── alist/client.go     # Alist REST client (auto re-login on 401)
-│   ├── config/config.go    # Local config (host/user/pass/token, 0600)
-│   └── pack/zip.go         # Zip folder/file
+│   ├── alist/client.go     # Alist REST client (auto re-login on 401, batch upload, exists check)
+│   ├── config/config.go    # Local config (host/user/pass/token, 0600, atomic write)
+│   └── pack/zip.go         # Zip folder/file (context-aware, streaming via io.Pipe)
 └── go.mod
 ```
