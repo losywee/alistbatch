@@ -173,9 +173,11 @@ func ensureClient(a *resolvedAuth, save bool) (*alist.Client, error) {
 	}
 	c := alist.NewClient(a.Host, a.Token)
 	c.SetCredentials(a.Username, a.Password)
-	c.OnTokenRefresh = func(newToken string) {
-		_ = config.Update(a.Host, "", "", newToken)
-		fmt.Fprintf(os.Stderr, "token refreshed and saved to %s\n", config.Path())
+	if save {
+		c.OnTokenRefresh = func(newToken string) {
+			_ = config.Update(a.Host, "", "", newToken)
+			fmt.Fprintf(os.Stderr, "token refreshed and saved to %s\n", config.Path())
+		}
 	}
 	if c.Token != "" {
 		return c, nil
@@ -480,6 +482,12 @@ func runPut(args []string) {
 			*concurrency = 32
 		}
 		if *useZip {
+			if *skipExisting {
+				fmt.Fprintln(os.Stderr, "warning: --skip-existing ignored for --zip (single zip upload)")
+			}
+			if *skipErrors {
+				fmt.Fprintln(os.Stderr, "warning: --skip-errors ignored for --zip (single zip upload)")
+			}
 			fmt.Fprintf(os.Stderr, "zipping and streaming folder %s -> %s\n", local, *remoteF)
 			if err := client.PutFolder(nil, local, *remoteF, opts, true, 0); err != nil {
 				fmt.Fprintf(os.Stderr, "put folder (zip) failed: %v\n", err)
@@ -487,9 +495,6 @@ func runPut(args []string) {
 			}
 			fmt.Fprintln(os.Stderr, "done")
 			return
-		}
-		if *skipExisting && *useZip {
-			fmt.Fprintln(os.Stderr, "warning: --skip-existing ignored for --zip (single zip upload)")
 		}
 		dirOpts := alist.UploadDirOptions{AsTask: *asTask, Concurrency: *concurrency, SkipErrors: *skipErrors, SkipExisting: *skipExisting}
 		if *concurrency > 1 {
@@ -705,13 +710,9 @@ func runConfig(args []string) {
 	})
 	fs := flag.NewFlagSet("config", flag.ExitOnError)
 	hostF := fs.String("H", "", "set host")
-	fs.String("host", "", "set host")
 	usernameF := fs.String("u", "", "set username")
-	fs.String("username", "", "set username")
 	passwordF := fs.String("p", "", "set password")
-	fs.String("password", "", "set password")
 	tokenF := fs.String("t", "", "set token")
-	fs.String("token", "", "set token")
 	clear := fs.Bool("clear", false, "clear config file")
 	showPath := fs.Bool("path", false, "print config file path")
 	jsonOut := fs.Bool("json", false, "output as JSON")
@@ -845,23 +846,10 @@ func runList(args []string) {
 		fmt.Fprintf(os.Stderr, "resolve auth: %v\n", err)
 		os.Exit(1)
 	}
-	if auth.Host == "" {
-		fmt.Fprintln(os.Stderr, "error: Alist host required (-H or ALIST_HOST or saved config)")
+	c, err := ensureClient(auth, true)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auth failed: %v\n", err)
 		os.Exit(1)
-	}
-	c := alist.NewClient(auth.Host, auth.Token)
-	c.SetCredentials(auth.Username, auth.Password)
-	c.OnTokenRefresh = func(newToken string) {
-		_ = config.Update(auth.Host, "", "", newToken)
-		fmt.Fprintf(os.Stderr, "token refreshed and saved to %s\n", config.Path())
-	}
-	if c.Token == "" && c.Username != "" && c.Password != "" {
-		fmt.Fprintf(os.Stderr, "logging in to %s as %s ...\n", auth.Host, c.Username)
-		if err := c.Login(c.Username, c.Password); err != nil {
-			fmt.Fprintf(os.Stderr, "login failed: %v\n", err)
-			os.Exit(1)
-		}
-		_ = config.Update(auth.Host, "", "", c.Token)
 	}
 
 	doList := func(cli *alist.Client) error {
@@ -960,16 +948,18 @@ func normalizeArgs(args []string, mapping map[string]string) []string {
 	for _, a := range args {
 		if v, ok := mapping[a]; ok {
 			out = append(out, v)
-		} else if strings.Contains(a, "=") {
+			continue
+		}
+		// Only treat flag-like args (starting with -) as mappable --key=value.
+		// Positional paths containing "=" must not be rewritten.
+		if strings.HasPrefix(a, "-") && strings.Contains(a, "=") {
 			parts := strings.SplitN(a, "=", 2)
 			if v, ok := mapping[parts[0]]; ok {
 				out = append(out, v+"="+parts[1])
-			} else {
-				out = append(out, a)
+				continue
 			}
-		} else {
-			out = append(out, a)
 		}
+		out = append(out, a)
 	}
 	return out
 }

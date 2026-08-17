@@ -1094,6 +1094,10 @@ func (c *Client) uploadDirSequentialWithOptions(ctx context.Context, localDir, r
 
 // uploadFileDirect uploads without EnsureDir (caller ensures dirs).
 func (c *Client) uploadFileDirect(ctx context.Context, localPath, remotePath string, asTask bool) error {
+	return c.uploadFileDirectWithRetry(ctx, localPath, remotePath, asTask, true)
+}
+
+func (c *Client) uploadFileDirectWithRetry(ctx context.Context, localPath, remotePath string, asTask bool, allowRetry bool) error {
 	fi, err := os.Stat(localPath)
 	if err != nil {
 		return err
@@ -1141,14 +1145,14 @@ func (c *Client) uploadFileDirect(ctx context.Context, localPath, remotePath str
 		return fmt.Errorf("upload decode: %w body=%s status=%d", err, string(b), resp.StatusCode)
 	}
 	if r.Code != 200 {
-		if isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
+		if allowRetry && isUnauthorizedCode(r.Code, r.Message) && c.canRelogin() {
 			logf("token expired, re-logging in ...\n")
 			if err := c.relogin(ctx); err != nil {
 				return fmt.Errorf("upload failed code=%d msg=%s (re-login failed: %v)", r.Code, r.Message, err)
 			}
 			shouldClose = false
 			f.Close()
-			return c.uploadFileDirect(ctx, localPath, remotePath, asTask)
+			return c.uploadFileDirectWithRetry(ctx, localPath, remotePath, asTask, false)
 		}
 		return fmt.Errorf("upload failed code=%d msg=%s body=%s", r.Code, r.Message, string(b))
 	}
